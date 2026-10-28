@@ -41,16 +41,25 @@ def verdict(d):
     return "worse" if better == 0 else "unclear"
 
 
+def paired(runs, base, metric):
+    seeds = sorted(s for s in set(runs) & set(base) if metric in runs[s] and metric in base[s])
+    return [(runs[s][metric] / base[s][metric] - 1) * 100 for s in seeds]
+
+
 def summarize(rows, metric="mse"):
-    groups = collections.defaultdict(dict)        # (data, H, model, ratio) -> variant -> seed -> row
+    groups = collections.defaultdict(dict)   # (data, H, model, ratio, scan) -> variant -> seed -> row
     for r in rows:
-        key = (r["data"], r["pred_len"], r["model"], r.get("train_var_ratio", 1.0))
+        key = (r["data"], r["pred_len"], r["model"], r.get("train_var_ratio", 1.0),
+               r.get("scan_order", "fixed"))
         groups[key].setdefault(variant(r), {})[r["seed"]] = r
     out = []
     for key in sorted(groups):
-        data, H, model, ratio = key
-        title = f"### {data}, H={H}, {model}" + (f", trained on {ratio:.0%} of variables" if ratio < 1 else "")
-        cols = ["mse", "mae"] + (["mse_seen", "mse_unseen"] if ratio < 1 else [])
+        data, H, model, ratio, scan = key
+        title = (f"### {data}, H={H}, {model}" + (f", scan order: {scan}" if scan != "fixed" else "")
+                 + (f", trained on {ratio:.0%} of variables" if ratio < 1 else ""))
+        has_orders = any("mse_orders" in r for v in groups[key].values() for r in v.values())
+        cols = (["mse", "mae"] + (["mse_orders", "mae_orders"] if has_orders else [])
+                + (["mse_seen", "mse_unseen"] if ratio < 1 else []))
         out += [title, "", "| variant | " + " | ".join(cols) + " | seeds | vs none (paired MSE) | verdict |",
                 "|---|" + "---|" * (len(cols) + 3)]
         base = groups[key].get("none", {})
@@ -61,15 +70,40 @@ def summarize(rows, metric="mse"):
                 xs = [r[c] for r in runs.values() if c in r]
                 cells.append(f"{st.mean(xs):.4f} ± {st.stdev(xs):.4f}" if len(xs) > 1 else
                              (f"{xs[0]:.4f}" if xs else "–"))
-            seeds = sorted(set(runs) & set(base))
-            if v != "none" and len(seeds) >= 2:
-                d = [(runs[s][metric] / base[s][metric] - 1) * 100 for s in seeds]
+            d = paired(runs, base, metric) if v != "none" else []
+            if len(d) >= 2:
                 cmp_, ver = f"{st.mean(d):+.2f}% ({sum(x < 0 for x in d)}/{len(d)} better)", verdict(d)
             else:
                 cmp_, ver = "–", "–"
             out.append(f"| {v} | " + " | ".join(cells) + f" | {len(runs)} | {cmp_} | {ver} |")
+        if has_orders:
+            out.append("")
+            out.append("(`*_orders`: the same trained model tested with the mixing averaged over "
+                       "several random scan orders)")
         out.append("")
+    out += order_hypothesis(groups, metric)
     return "\n".join(out)
+
+
+def order_hypothesis(groups, metric):
+    """Identity gain with the original scan order vs with a shuffled scan order (S-Mamba)."""
+    lines = []
+    for (data, H, model, ratio, scan) in sorted(groups):
+        if scan != "shuffle" or (data, H, model, ratio, "fixed") not in groups:
+            continue
+        fixed, shuf = groups[(data, H, model, ratio, "fixed")], groups[(data, H, model, ratio, scan)]
+        if not all(k in g for g in (fixed, shuf) for k in ("none", "add")):
+            continue
+        g_fixed = paired(fixed["add"], fixed["none"], metric)
+        g_shuf = paired(shuf["add"], shuf["none"], metric)
+        cost = paired(shuf["none"], fixed["none"], metric)
+        if lines == []:
+            lines = ["### Does the fixed scan order act as an identity? (S-Mamba, identity `add`)", "",
+                     "| data | H | identity gain, fixed order | identity gain, shuffled order "
+                     "| shuffling cost without identity |", "|---|---|---|---|---|"]
+        f = lambda d: f"{st.mean(d):+.2f}% ({sum(x < 0 for x in d)}/{len(d)})" if d else "–"
+        lines.append(f"| {data} | {H} | {f(g_fixed)} | {f(g_shuf)} | {f(cost)} |")
+    return lines + [""] if lines else []
 
 
 if __name__ == "__main__":

@@ -75,7 +75,8 @@ def run(cfg, log=print):
         d_ff=cfg["d_ff"], e_layers=cfg["e_layers"], n_heads=cfg["n_heads"], d_state=cfg["d_state"],
         dropout=cfg["dropout"], activation=cfg["activation"], use_norm=cfg["use_norm"],
         identity=cfg["identity"], id_rank=cfg["id_rank"], id_loc=cfg["id_loc"],
-        id_dropout=cfg["id_dropout"], mamba_impl=cfg["mamba_impl"]).to(device)
+        id_dropout=cfg["id_dropout"], mamba_impl=cfg["mamba_impl"],
+        scan_order=cfg.get("scan_order", "fixed")).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     # identity parameters start at zero and Adam moves them by about lr per step, so with the
     # small official learning rates (5e-5 .. 1e-3) they can be given a larger one
@@ -133,9 +134,15 @@ def run(cfg, log=print):
             ident.active.copy_(mask)
     t1 = time.time()
     metrics = evaluate(model, test, None, amp_dtype=amp_dtype, groups=groups)
+    k = cfg.get("eval_orders", 1)
+    if k > 1:                                      # same model, scan-order averaging at test
+        model.set_eval_orders(k)
+        avg = evaluate(model, test, None, amp_dtype=amp_dtype, groups=groups)
+        metrics.update({f"{name}_orders": v for name, v in avg.items()})
+        model.set_eval_orders(1)
     result = dict(cfg, val_mse=best, best_epoch=best_epoch, epochs_run=epoch + 1,
                   train_time_s=round(train_time, 1), test_time_s=round(time.time() - t1, 1),
-                  n_params=n_params, n_vars=n_vars, **metrics)
+                  n_params=n_params, n_vars=n_vars, mamba_backend=model.mamba_backend(), **metrics)
     if device.type == "cuda":
         result["peak_mem_gb"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)
     return result, model, cols

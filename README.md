@@ -12,6 +12,8 @@ h_i = Linear(x_i) + e_i ,   i = 1..N      （e_i 从 0 开始学习）
 
 **已有相关工作**：STID（CIKM 2022）在时空预测中引入了空间身份嵌入；EMAformer（AAAI 2026）给 iTransformer 加了辅助嵌入；ss-Mamba（2025）用语义身份嵌入。身份嵌入本身不是新想法；本仓库的重点是在 S-Mamba 上系统验证它，并回答几个尚未回答的问题：用多大的表（满秩还是低秩）、放在哪里、学习率怎么设，以及遇到训练时没见过的变量怎么办。
 
+**结果与论文存放位置**：本仓库只放代码。所有实验结果（`results/*.jsonl`）、分析和论文统一提交到 [`unforgettablerep/newpaper`](https://github.com/unforgettablerep/newpaper)；本仓库的 `.gitignore` 会忽略本地的 `results/` 目录，跑完后把其中的 JSONL 文件放进 newpaper 仓库的 `results/` 目录。
+
 ---
 
 ## 1. 方法（`idembed/identity.py`、`idembed/models.py`）
@@ -25,6 +27,8 @@ h_i = Linear(x_i) + e_i ,   i = 1..N      （e_i 从 0 开始学习）
 | `--id-dropout p` | 训练时以概率 p 把某个变量的身份置零，让模型也学会不依赖身份 |
 | `--id-lr-mult m` | 身份参数的学习率是主学习率的 m 倍。身份参数从 0 开始，Adam 每步大约只移动一个学习率的幅度，而官方学习率很小（Weather 5e-5、ETTh1 7e-5） |
 | `--train-var-ratio ρ` | 未见变量协议：只用随机选出的 ρ 比例的变量训练和验证，测试时预测全部变量，并分别报告已见 / 未见变量的误差；未见变量使用零身份 |
+| `--scan-order shuffle` | （仅 S-Mamba）训练时每一层、每一步都按随机顺序扫描 token，使"在扫描序列中的位置"不再携带变量信息；测试默认按原始顺序 |
+| `--eval-orders K` | 训练好的模型额外在测试时把每层的 Mamba 混合输出在 K 个固定随机顺序上取平均，结果记为 `mse_orders` / `mae_orders`（不需要重新训练） |
 
 - 身份只加在变量 token 上，日历特征 token 不加。
 - 所有形式在初始化时 E = 0，并且不消耗全局随机数，所以同一种子下加身份前后的模型在初始化时逐位相同（见测试）。两者的差异只来自训练。
@@ -75,6 +79,7 @@ python run.py --model smamba --data Electricity --train-var-ratio 0.4 --identity
 | `scripts/run_quick.sh` | ETTh1 / Weather / Electricity，预测 96 步，两种骨架 × {无, 有身份} × 3 个种子：先在官方规模上复核前期结论 | 36 |
 | `scripts/run_main.sh` | 全部数据集 × 全部预测长度（PEMS 为 12/24/48/96，其余为 96/192/336/720）× 两种骨架 × {无, 有身份} × 3 个种子；缺少的数据集会跳过 | 全部数据齐时 576 |
 | `scripts/run_ablation.sh` | S-Mamba，3 个数据集 × 3 个种子：满秩 / 低秩 r=8、32 / 逐层注入 / 身份 dropout / 10 倍身份学习率，以及未见变量协议（训练用 40% 的变量） | 90 |
+| `scripts/run_order.sh` | 检验"S-Mamba 的固定扫描顺序本身起到了身份的作用"：S-Mamba 用随机扫描顺序训练 × {无, 有身份} × 3 个数据集 × 3 个种子，每次同时报告原始顺序和 4 个顺序平均的测试误差；固定顺序的对照直接复用 `run_quick.sh` 的结果（`RUN_FIXED=1` 可在此重跑） | 18 |
 
 可以用环境变量缩小范围，例如 `DATASETS="Electricity Traffic" SEEDS="0" bash scripts/run_main.sh`。运行时间主要花在 Traffic、Electricity 和 PEMS07 上。
 
@@ -107,14 +112,17 @@ python -m pytest -q tests        # CPU 上约 1 分钟
 - 身份 dropout 只在训练时生效，日历 token 不受影响；
 - 未见变量拿不到梯度、测试时为零身份；
 - `MambaTorch` 的分块扫描与逐步递推一致，且满足因果性；
+- 随机扫描顺序只影响训练和多顺序平均的测试，按原始顺序测试时与固定顺序模型完全相同；
 - 官方划分边界、目标列后移和标准化；
 - 命令行端到端运行，以及汇总、分析工具。
 
 ## 7. 当前状态
 
-- **已在 CPU 上验证**：19 项单元测试全部通过；用 S-Mamba 官方配置在 ETTh1 上完整训练一遍（预测 96 步，种子 0），测试 MSE / MAE 为 **0.3866 / 0.4053**，与论文报告的 0.386 / 0.405 一致，说明结构和训练协议是忠实的。同一设置下加满秩身份嵌入为 0.3866 / 0.4052，几乎没有变化，这与前期研究的结论（ETTh1 上无收益）一致。也说明在官方的小学习率（7e-5）下，从 0 开始的身份参数移动得很慢，所以消融中加入了 `--id-lr-mult 10`。
-- **尚未在 GPU 上运行**：开发环境没有 GPU，`mamba_ssm` CUDA 内核这条路径和 4090 上的速度与显存都没有实测。拿到机器后请先运行 `python scripts/check_env.py`，它会核对 CUDA 内核与纯 PyTorch 实现的输出是否一致。
-- **尚无全尺寸结果**：仓库中的数字只有前期 CPU 研究（缩小的模型）和上面这一次 ETTh1 检查。身份嵌入在官方规模上是否依然有效，需要运行 `scripts/run_quick.sh` 和 `scripts/run_main.sh` 才能回答。
+- **4090 上的快速实验已完成**（`run_quick.sh`，36 次运行）：两种骨架的基线都复现了论文数字（例如 S-Mamba 在 Electricity 上为 0.1389 / 0.2362，论文为 0.139 / 0.235；iTransformer 为 0.1482 / 0.2398，论文为 0.148 / 0.240）。身份嵌入在 Electricity 和 Weather 上对两种骨架都有效（3/3 个种子更好）：iTransformer 分别 −7.8%、−5.2%，S-Mamba 分别 −1.4%、−1.8%；在 ETTh1 上没有作用。原始结果和完整分析见 [newpaper 仓库](https://github.com/unforgettablerep/newpaper)。
+- **CPU 上的验证**：21 项单元测试全部通过；用 S-Mamba 官方配置在 ETTh1 上完整训练，结果为 0.3866 / 0.4053，与论文一致。
+- **结果文件现在记录实际使用的 Mamba 实现**（`mamba_backend`：`cuda` 为 mamba_ssm 内核，`torch` 为纯 PyTorch 回退，iTransformer 为 `null`）。快速实验的结果文件早于这项改动，没有这个字段。
+- **加入了随机扫描顺序选项**，用来检验"S-Mamba 的提升比 iTransformer 小，是因为固定扫描顺序已经起到了一部分身份作用"这一推测（`scripts/run_order.sh`）。固定顺序时，加入该选项前后的计算逐位相同，所以新实验可以直接和已有的快速实验结果配对比较。
+- **待运行**：`run_order.sh`、`run_ablation.sh`、`run_main.sh`。
 
 ## 8. 目录结构
 
@@ -122,7 +130,7 @@ python -m pytest -q tests        # CPU 上约 1 分钟
 idembed/          data.py（数据与划分） identity.py（身份嵌入） mamba.py（CUDA / 纯 PyTorch Mamba）
                   models.py（iTransformer、S-Mamba） engine.py（训练与评估） configs.py（超参数与来源）
 run.py            单次运行的命令行入口
-scripts/          download_data.sh  check_env.py  run_quick.sh  run_main.sh  run_ablation.sh
+scripts/          download_data.sh  check_env.py  run_quick.sh  run_main.sh  run_ablation.sh  run_order.sh
 tools/            summarize.py（结果汇总与判定）  analyze_identity.py（身份嵌入的可解释性）
 tests/            test_core.py
 experiments_cpu/  前期 CPU 探索实验（合成数据 Hub-SSM / 稀疏混合，真实数据上的改进对比），从 paperlib 迁入

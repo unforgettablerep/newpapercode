@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .identity import VariableIdentity
-from .mamba import build_mamba
+from .mamba import MambaTorch, build_mamba
 
 
 class DataEmbeddingInverted(nn.Module):
@@ -72,31 +72,59 @@ class TransformerLayer(nn.Module):
 
 class MambaLayer(nn.Module):
     """S-Mamba EncoderLayer: a forward and a reversed Mamba over the token sequence, summed;
-    x = LN(x + Mamba(x) + flip(Mamba_r(flip(x)))); x = LN(x + FFN(x))."""
+    x = LN(x + Mamba(x) + flip(Mamba_r(flip(x)))); x = LN(x + FFN(x)).
 
-    def __init__(self, d_model, d_state, d_ff, dropout, activation, mamba_impl="auto"):
+    scan_order='shuffle' scans the tokens in a fresh random order at every training step, so
+    a token's position in the scan carries no information about which variable it is. Setting
+    `eval_orders` = K > 1 (evaluation only) averages the mixing output over K fixed random
+    orders; K = 1 scans in the original order."""
+
+    def __init__(self, d_model, d_state, d_ff, dropout, activation, mamba_impl="auto",
+                 scan_order="fixed"):
         super().__init__()
+        if scan_order not in ("fixed", "shuffle"):
+            raise ValueError(scan_order)
+        self.scan_order, self.eval_orders = scan_order, 1
         self.fwd = build_mamba(d_model, d_state, d_conv=2, expand=1, impl=mamba_impl)
         self.bwd = build_mamba(d_model, d_state, d_conv=2, expand=1, impl=mamba_impl)
         self.ffn = FeedForward(d_model, d_ff, dropout, activation)
         self.norm1, self.norm2 = nn.LayerNorm(d_model), nn.LayerNorm(d_model)
 
+    def mix(self, x, perm=None):
+        if perm is None:
+            return self.fwd(x) + self.bwd(x.flip(1)).flip(1)
+        xp = x[:, perm]
+        return (self.fwd(xp) + self.bwd(xp.flip(1)).flip(1))[:, torch.argsort(perm)]
+
     def forward(self, x):
-        x = self.norm1(x + self.fwd(x) + self.bwd(x.flip(1)).flip(1))
+        T = x.shape[1]
+        if self.training and self.scan_order == "shuffle":
+            x = self.norm1(x + self.mix(x, torch.randperm(T, device=x.device)))
+        elif not self.training and self.eval_orders > 1:
+            g = torch.Generator().manual_seed(12345)
+            m = torch.stack([self.mix(x, torch.randperm(T, generator=g).to(x.device))
+                             for _ in range(self.eval_orders)]).mean(0)
+            x = self.norm1(x + m)
+        else:                                       # original order, same arithmetic as S-Mamba
+            x = self.norm1(x + self.fwd(x) + self.bwd(x.flip(1)).flip(1))
         return self.norm2(x + self.ffn(x))
 
 
 class VariateForecaster(nn.Module):
     def __init__(self, backbone, n_vars, seq_len, pred_len, d_model=512, d_ff=512, e_layers=2,
                  n_heads=8, d_state=16, dropout=0.1, activation="gelu", use_norm=True,
-                 identity="none", id_rank=8, id_loc="input", id_dropout=0.0, mamba_impl="auto"):
+                 identity="none", id_rank=8, id_loc="input", id_dropout=0.0, mamba_impl="auto",
+                 scan_order="fixed"):
         super().__init__()
         self.use_norm, self.pred_len, self.id_loc = use_norm, pred_len, id_loc
         self.embedding = DataEmbeddingInverted(seq_len, d_model, dropout)
         if backbone == "itransformer":
+            if scan_order != "fixed":
+                raise ValueError("scan_order applies to S-Mamba only")
             make = lambda: TransformerLayer(d_model, n_heads, d_ff, dropout, activation)
         elif backbone == "smamba":
-            make = lambda: MambaLayer(d_model, d_state, d_ff, dropout, activation, mamba_impl)
+            make = lambda: MambaLayer(d_model, d_state, d_ff, dropout, activation, mamba_impl,
+                                      scan_order)
         else:
             raise ValueError(backbone)
         self.layers = nn.ModuleList(make() for _ in range(e_layers))
@@ -132,3 +160,16 @@ class VariateForecaster(nn.Module):
     def identity_weight(self):
         """The input-level identity table (N, D), or None."""
         return self.identity[0].weight()
+
+    def set_eval_orders(self, k):
+        """Number of random scan orders averaged at evaluation (S-Mamba; 1 = original order)."""
+        for layer in self.layers:
+            if isinstance(layer, MambaLayer):
+                layer.eval_orders = k
+
+    def mamba_backend(self):
+        """'cuda' (mamba_ssm kernel), 'torch' (MambaTorch) or None (no Mamba layers)."""
+        for layer in self.layers:
+            if isinstance(layer, MambaLayer):
+                return "torch" if isinstance(layer.fwd, MambaTorch) else "cuda"
+        return None

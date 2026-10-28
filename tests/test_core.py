@@ -81,6 +81,36 @@ def test_unseen_rows_get_no_gradient_and_can_be_switched_off():
         assert out[0, [1, 3, 4]].abs().sum() == 0
 
 
+def test_shuffled_scan_order_only_changes_training_and_averaged_evaluation():
+    fixed = small_model("smamba").eval()
+    shuf = small_model("smamba", scan_order="shuffle").eval()
+    x = torch.randn(2, 24, 5)
+    with torch.no_grad():
+        assert torch.equal(fixed(x), shuf(x))                 # same weights, original order at test
+        shuf.set_eval_orders(3)
+        a, b = shuf(x), shuf(x)
+        assert torch.equal(a, b)                              # fixed set of evaluation orders
+        assert not torch.allclose(a, fixed(x))
+        shuf.set_eval_orders(1)
+        torch.manual_seed(1)
+        t1 = shuf.train()(x)
+        torch.manual_seed(2)
+        t2 = shuf(x)
+    assert not torch.allclose(t1, t2)                         # a new random order per step
+    assert fixed.mamba_backend() == "torch" and small_model("itransformer").mamba_backend() is None
+    with pytest.raises(ValueError):
+        small_model("itransformer", scan_order="shuffle")
+
+
+def test_mixing_in_a_permuted_order_is_undone():
+    layer = small_model("smamba").layers[0].eval()
+    x = torch.randn(2, 5, 32)
+    perm = torch.tensor([3, 0, 4, 1, 2])
+    with torch.no_grad():
+        direct = layer.mix(x[:, perm])                       # scan the permuted sequence
+        assert torch.allclose(layer.mix(x, perm), direct[:, torch.argsort(perm)], atol=1e-6)
+
+
 @pytest.mark.parametrize("chunk", [3, 4, 7])
 def test_torch_mamba_scan_matches_sequential_recurrence(chunk):
     torch.manual_seed(0)
@@ -154,14 +184,23 @@ def test_end_to_end_cli(tmp_path):
                   "--save-ckpt", str(tmp_path / "ck")],
                  ["--model", "itransformer", "--identity", "lowrank", "--id-rank", "4"],
                  ["--model", "smamba", "--identity", "add", "--id-dropout", "0.3",
-                  "--train-var-ratio", "0.5"]):
+                  "--train-var-ratio", "0.5"],
+                 ["--model", "smamba", "--identity", "none", "--scan-order", "shuffle",
+                  "--eval-orders", "2"],
+                 ["--model", "smamba", "--identity", "add", "--scan-order", "shuffle",
+                  "--eval-orders", "2"],
+                 ["--model", "smamba", "--identity", "none"],
+                 ["--model", "smamba", "--identity", "add"]):
         subprocess.run(common + args, check=True, cwd=ROOT, capture_output=True)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
-    assert len(rows) == 3 and all(np.isfinite(r["mse"]) for r in rows)
+    assert len(rows) == 7 and all(np.isfinite(r["mse"]) for r in rows)
     assert "mse_unseen" in rows[2] and "mse_seen" in rows[2]
+    assert "mse_orders" in rows[3] and rows[0]["mamba_backend"] == "torch"
+    assert rows[1]["mamba_backend"] is None
     summary = subprocess.run([sys.executable, str(ROOT / "tools" / "summarize.py"), str(out)],
                              check=True, cwd=ROOT, capture_output=True, text=True).stdout
-    assert "Weather" in summary
+    assert "Weather" in summary and "scan order: shuffle" in summary
+    assert "Does the fixed scan order act as an identity?" in summary
     ck = next((tmp_path / "ck").glob("*.pt"))
     res = subprocess.run([sys.executable, str(ROOT / "tools" / "analyze_identity.py"), str(ck),
                           "--root-path", str(tmp_path)], check=True, cwd=ROOT,
