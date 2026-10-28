@@ -1,0 +1,7 @@
+torch>=2.1
+numpy
+pandas
+pytest
+# fast Mamba kernels on the GPU (optional; needs a CUDA toolkit matching your PyTorch build):
+# causal-conv1d>=1.4.0
+# mamba-ssm>=2.2
