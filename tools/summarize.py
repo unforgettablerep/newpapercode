@@ -9,6 +9,7 @@ mean paired MSE change is at most -1%; "marginal" if better on every seed but by
 """
 import collections
 import json
+import re
 import statistics as st
 import sys
 
@@ -47,18 +48,24 @@ def paired(runs, base, metric):
 
 
 def summarize(rows, metric="mse"):
-    groups = collections.defaultdict(dict)   # (data, H, model, ratio, scan) -> variant -> seed -> row
+    # (data, H, model, ratio, scan, perm, tag) -> variant -> seed -> row
+    groups = collections.defaultdict(dict)
     for r in rows:
         key = (r["data"], r["pred_len"], r["model"], r.get("train_var_ratio", 1.0),
-               r.get("scan_order", "fixed"))
+               r.get("scan_order", "fixed"), r.get("var_perm", -1), r.get("tag", ""))
         groups[key].setdefault(variant(r), {})[r["seed"]] = r
     out = []
     for key in sorted(groups):
-        data, H, model, ratio, scan = key
+        data, H, model, ratio, scan, perm, tag = key
         title = (f"### {data}, H={H}, {model}" + (f", scan order: {scan}" if scan != "fixed" else "")
+                 + (f", variables in random order {perm}" if perm != -1 else "")
+                 + (f", tag `{tag}`" if tag else "")
                  + (f", trained on {ratio:.0%} of variables" if ratio < 1 else ""))
-        has_orders = any("mse_orders" in r for v in groups[key].values() for r in v.values())
-        cols = (["mse", "mae"] + (["mse_orders", "mae_orders"] if has_orders else [])
+        present = {c for v in groups[key].values() for r in v.values() for c in r}
+        sweep = sorted((c for c in present if re.fullmatch(r"mse_orders\d+", c)),
+                       key=lambda c: int(c[10:]))
+        has_orders = "mse_orders" in present
+        cols = (["mse", "mae"] + (sweep or (["mse_orders", "mae_orders"] if has_orders else []))
                 + (["mse_seen", "mse_unseen"] if ratio < 1 else []))
         out += [title, "", "| variant | " + " | ".join(cols) + " | seeds | vs none (paired MSE) | verdict |",
                 "|---|" + "---|" * (len(cols) + 3)]
@@ -78,8 +85,8 @@ def summarize(rows, metric="mse"):
             out.append(f"| {v} | " + " | ".join(cells) + f" | {len(runs)} | {cmp_} | {ver} |")
         if has_orders:
             out.append("")
-            out.append("(`*_orders`: the same trained model tested with the mixing averaged over "
-                       "several random scan orders)")
+            out.append("(`*_orders`, `mse_ordersK`: the same trained model tested with the mixing "
+                       "averaged over several / K random scan orders)")
         out.append("")
     out += order_hypothesis(groups, metric)
     return "\n".join(out)
@@ -88,10 +95,11 @@ def summarize(rows, metric="mse"):
 def order_hypothesis(groups, metric):
     """Identity gain with the original scan order vs with a shuffled scan order (S-Mamba)."""
     lines = []
-    for (data, H, model, ratio, scan) in sorted(groups):
-        if scan != "shuffle" or (data, H, model, ratio, "fixed") not in groups:
+    for (data, H, model, ratio, scan, perm, tag) in sorted(groups):
+        if scan != "shuffle" or (data, H, model, ratio, "fixed", perm, tag) not in groups:
             continue
-        fixed, shuf = groups[(data, H, model, ratio, "fixed")], groups[(data, H, model, ratio, scan)]
+        fixed = groups[(data, H, model, ratio, "fixed", perm, tag)]
+        shuf = groups[(data, H, model, ratio, scan, perm, tag)]
         if not all(k in g for g in (fixed, shuf) for k in ("none", "add")):
             continue
         g_fixed = paired(fixed["add"], fixed["none"], metric)

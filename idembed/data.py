@@ -99,8 +99,18 @@ class Split:
         return x, m, y
 
 
-def load_splits(name, root, seq_len=96, pred_len=96, use_marks=True, device="cpu"):
+def permutation(n, seed):
+    """The fixed random order of the n variables used by load_splits(var_perm=seed)."""
+    return np.random.default_rng(seed).permutation(n)
+
+
+def load_splits(name, root, seq_len=96, pred_len=96, use_marks=True, device="cpu", var_perm=None):
+    """var_perm: if given, the variables are listed in the fixed random order
+    permutation(N, var_perm) instead of the file's column order."""
     values, marks, cols = read_raw(name, root)
+    if var_perm is not None:
+        perm = permutation(values.shape[1], var_perm)
+        values, cols = values[:, perm], [cols[i] for i in perm]
     rule = DATASETS[name][1]
     b1, b2 = borders(rule, len(values), seq_len)
     train = values[b1[0]:b2[0]]

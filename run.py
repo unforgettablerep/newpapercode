@@ -4,6 +4,7 @@ Examples
   python run.py --model smamba --data Electricity --pred-len 96 --identity add --seed 0
   python run.py --model itransformer --data Weather --pred-len 336 --identity lowrank --id-rank 8
   python run.py --model smamba --data Electricity --train-var-ratio 0.4 --identity add --id-dropout 0.3
+  python run.py --model smamba --data Electricity --scan-order shuffle --identity add --eval-orders 2,4,8
 
 Defaults for every dataset come from idembed/configs.py; any flag below overrides them.
 """
@@ -36,8 +37,14 @@ def parse():
     # S-Mamba scan order
     ap.add_argument("--scan-order", choices=["fixed", "shuffle"], default="fixed",
                     help="shuffle: random token scan order at every training step (S-Mamba)")
-    ap.add_argument("--eval-orders", type=int, default=1,
-                    help="also test with the mixing averaged over this many random scan orders")
+    ap.add_argument("--eval-orders", default="1",
+                    help="also test with the mixing averaged over this many random scan orders; "
+                         "a comma-separated list (e.g. 2,4,8) tests each")
+    ap.add_argument("--var-perm", type=int, default=None,
+                    help="list the variables in a fixed random order (this seed) instead of the "
+                         "file's column order")
+    ap.add_argument("--per-var", action="store_true",
+                    help="store per-variable test/validation errors and split statistics")
     # model / training overrides
     for name, typ in [("d-model", int), ("d-ff", int), ("e-layers", int), ("n-heads", int),
                       ("d-state", int), ("dropout", float), ("lr", float), ("batch-size", int),
@@ -57,14 +64,20 @@ def parse():
 
 def main():
     a = parse()
+    ks = [int(k) for k in a.eval_orders.split(",")]
+    eval_orders = ks[0] if len(ks) == 1 else ks
     cfg = get_config(a.model, a.data)
     cfg.update(model=a.model, data=a.data, root_path=a.root_path, pred_len=a.pred_len, seed=a.seed,
                identity=a.identity, id_rank=a.id_rank, id_loc=a.id_loc, id_dropout=a.id_dropout,
-               id_lr_mult=a.id_lr_mult, scan_order=a.scan_order, eval_orders=a.eval_orders,
+               id_lr_mult=a.id_lr_mult, scan_order=a.scan_order, eval_orders=eval_orders,
                train_var_ratio=a.train_var_ratio, use_marks=not a.no_marks,
                amp=a.amp, tf32=a.tf32, mamba_impl=a.mamba_impl, device=a.device, tag=a.tag)
     if a.no_norm:
         cfg["use_norm"] = False
+    if a.var_perm is not None:
+        cfg["var_perm"] = a.var_perm
+    if a.per_var:
+        cfg["per_var"] = True
     for k in ["seq_len", "d_model", "d_ff", "e_layers", "n_heads", "d_state", "dropout", "lr",
               "batch_size", "epochs", "patience"]:
         v = getattr(a, k)
@@ -77,13 +90,15 @@ def main():
         f.write(json.dumps(result) + "\n")
     print(f"test mse {result['mse']:.4f}  mae {result['mae']:.4f}  (best epoch {result['best_epoch']}, "
           f"mamba backend {result['mamba_backend']})")
-    if "mse_orders" in result:
-        print(f"averaged over {a.eval_orders} scan orders: mse {result['mse_orders']:.4f}  "
-              f"mae {result['mae_orders']:.4f}")
+    for k in sorted(k for k in ks if k > 1):
+        sfx = f"_orders{k}" if f"mse_orders{k}" in result else "_orders"
+        print(f"averaged over {k} scan orders: mse {result['mse' + sfx]:.4f}  "
+              f"mae {result['mae' + sfx]:.4f}")
     if a.save_ckpt:
         os.makedirs(a.save_ckpt, exist_ok=True)
         name = (f"{a.model}_{a.data}_{a.pred_len}_{a.identity}_{a.id_loc}_r{a.id_rank}"
-                f"_p{a.id_dropout}_m{a.id_lr_mult}_v{a.train_var_ratio}_{a.scan_order}_s{a.seed}.pt")
+                f"_p{a.id_dropout}_m{a.id_lr_mult}_v{a.train_var_ratio}_{a.scan_order}"
+                + ("" if a.var_perm is None else f"_perm{a.var_perm}") + f"_s{a.seed}.pt")
         torch.save({"config": cfg, "state_dict": model.state_dict(), "columns": cols},
                    Path(a.save_ckpt) / name)
 

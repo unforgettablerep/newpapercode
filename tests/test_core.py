@@ -10,7 +10,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from idembed.data import borders, load_splits, time_features  # noqa: E402
+from idembed.data import borders, load_splits, permutation, time_features  # noqa: E402
 from idembed.identity import VariableIdentity  # noqa: E402
 from idembed.mamba import MambaTorch  # noqa: E402
 from idembed.models import VariateForecaster  # noqa: E402
@@ -173,6 +173,16 @@ def test_custom_loader_moves_target_last_and_scales(tmp_path):
     assert ptrain.marks is None and len(pcols) == 7
 
 
+def test_fixed_variable_permutation(tmp_path):
+    write_fake_data(tmp_path)
+    (train, _, test), cols = load_splits("Weather", tmp_path, 24, 8)
+    (ptrain, _, ptest), pcols = load_splits("Weather", tmp_path, 24, 8, var_perm=3)
+    perm = permutation(6, 3)
+    assert list(perm) != list(range(6)) and pcols == [cols[i] for i in perm]
+    assert torch.equal(ptrain.values, train.values[:, perm])
+    assert torch.equal(ptest.values, test.values[:, perm])
+
+
 def test_end_to_end_cli(tmp_path):
     write_fake_data(tmp_path)
     out = tmp_path / "res.jsonl"
@@ -190,17 +200,31 @@ def test_end_to_end_cli(tmp_path):
                  ["--model", "smamba", "--identity", "add", "--scan-order", "shuffle",
                   "--eval-orders", "2"],
                  ["--model", "smamba", "--identity", "none"],
-                 ["--model", "smamba", "--identity", "add"]):
+                 ["--model", "smamba", "--identity", "add"],
+                 ["--model", "smamba", "--identity", "none", "--per-var", "--var-perm", "1"],
+                 ["--model", "smamba", "--identity", "add", "--per-var", "--var-perm", "1"],
+                 ["--model", "smamba", "--identity", "add", "--scan-order", "shuffle",
+                  "--eval-orders", "2,3"]):
         subprocess.run(common + args, check=True, cwd=ROOT, capture_output=True)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
-    assert len(rows) == 7 and all(np.isfinite(r["mse"]) for r in rows)
+    assert len(rows) == 10 and all(np.isfinite(r["mse"]) for r in rows)
     assert "mse_unseen" in rows[2] and "mse_seen" in rows[2]
     assert "mse_orders" in rows[3] and rows[0]["mamba_backend"] == "torch"
     assert rows[1]["mamba_backend"] is None
+    pv = rows[7]["per_var"]                       # per-variable results, in file column order
+    assert pv["columns"] == ["v0", "v1", "v2", "v3", "v4", "OT"] and len(pv["test_mse"]) == 6
+    assert abs(np.mean(pv["test_mse"]) / rows[7]["mse"] - 1) < 1e-4
+    assert {"val_mse", "val_mean", "test_mean", "test_std"} <= set(pv) and "per_var" not in rows[6]
+    assert {"mse_orders2", "mse_orders3"} <= set(rows[9])
+    assert rows[9]["mse_orders"] == rows[9]["mse_orders3"]
     summary = subprocess.run([sys.executable, str(ROOT / "tools" / "summarize.py"), str(out)],
                              check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "Weather" in summary and "scan order: shuffle" in summary
     assert "Does the fixed scan order act as an identity?" in summary
+    assert "variables in random order 1" in summary and "mse_orders3" in summary
+    res = subprocess.run([sys.executable, str(ROOT / "tools" / "per_variable.py"), str(out)],
+                         check=True, cwd=ROOT, capture_output=True, text=True).stdout
+    assert "random order 1" in res and "most harmed" in res
     ck = next((tmp_path / "ck").glob("*.pt"))
     res = subprocess.run([sys.executable, str(ROOT / "tools" / "analyze_identity.py"), str(ck),
                           "--root-path", str(tmp_path)], check=True, cwd=ROOT,
