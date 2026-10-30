@@ -6,7 +6,9 @@ Examples
   python run.py --model smamba --data Electricity --train-var-ratio 0.4 --identity add --id-dropout 0.3
   python run.py --model smamba --data Electricity --scan-order shuffle --identity add --eval-orders 2,4,8
 
-Defaults for every dataset come from idembed/configs.py; any flag below overrides them.
+Defaults for every dataset and horizon come from idembed/configs.py (the official run
+scripts; --config legacy for the table used up to newpapercode a48f354); any flag below
+overrides them.
 """
 import argparse
 import json
@@ -25,6 +27,8 @@ def parse():
     ap.add_argument("--pred-len", type=int, default=96)
     ap.add_argument("--seq-len", type=int)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--config", choices=["official", "legacy"], default="official",
+                    help="default hyperparameter table (see idembed/configs.py)")
     # identity embedding
     ap.add_argument("--identity", choices=["none", "add", "lowrank"], default="none")
     ap.add_argument("--id-rank", type=int, default=8)
@@ -66,7 +70,7 @@ def main():
     a = parse()
     ks = [int(k) for k in a.eval_orders.split(",")]
     eval_orders = ks[0] if len(ks) == 1 else ks
-    cfg = get_config(a.model, a.data)
+    cfg = get_config(a.model, a.data, a.pred_len, a.config)
     cfg.update(model=a.model, data=a.data, root_path=a.root_path, pred_len=a.pred_len, seed=a.seed,
                identity=a.identity, id_rank=a.id_rank, id_loc=a.id_loc, id_dropout=a.id_dropout,
                id_lr_mult=a.id_lr_mult, scan_order=a.scan_order, eval_orders=eval_orders,

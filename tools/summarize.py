@@ -14,6 +14,20 @@ import statistics as st
 import sys
 
 
+TRAINING_KEYS = ("seq_len", "e_layers", "d_model", "d_ff", "d_state", "lr", "batch_size", "epochs",
+                 "dropout")
+
+
+def by_config(key):
+    """Sort key for the groups (the training settings may contain None)."""
+    return key[:-1], str(key[-1])
+
+
+def training(r):
+    """The training settings of a run; runs are only paired when these are identical."""
+    return tuple(r.get(k) for k in TRAINING_KEYS)
+
+
 def variant(r):
     if r["identity"] == "none":
         return "none"
@@ -48,18 +62,24 @@ def paired(runs, base, metric):
 
 
 def summarize(rows, metric="mse"):
-    # (data, H, model, ratio, scan, perm, tag) -> variant -> seed -> row
+    # (data, H, model, ratio, scan, perm, tag, training settings) -> variant -> seed -> row
     groups = collections.defaultdict(dict)
     for r in rows:
         key = (r["data"], r["pred_len"], r["model"], r.get("train_var_ratio", 1.0),
-               r.get("scan_order", "fixed"), r.get("var_perm", -1), r.get("tag", ""))
+               r.get("scan_order", "fixed"), r.get("var_perm", -1), r.get("tag", ""), training(r))
         groups[key].setdefault(variant(r), {})[r["seed"]] = r
+    settings = collections.defaultdict(set)    # several training settings for one configuration?
+    for key in groups:
+        settings[key[:3]].add(key[-1])
     out = []
-    for key in sorted(groups):
-        data, H, model, ratio, scan, perm, tag = key
+    for key in sorted(groups, key=by_config):
+        data, H, model, ratio, scan, perm, tag, hp = key
         title = (f"### {data}, H={H}, {model}" + (f", scan order: {scan}" if scan != "fixed" else "")
                  + (f", variables in random order {perm}" if perm != -1 else "")
                  + (f", tag `{tag}`" if tag else "")
+                 + ("" if len(settings[key[:3]]) == 1 else ", " + ", ".join(
+                     f"{k}={v}" for k, v in zip(TRAINING_KEYS, hp) if len(
+                         {h[TRAINING_KEYS.index(k)] for h in settings[key[:3]]}) > 1))
                  + (f", trained on {ratio:.0%} of variables" if ratio < 1 else ""))
         present = {c for v in groups[key].values() for r in v.values() for c in r}
         sweep = sorted((c for c in present if re.fullmatch(r"mse_orders\d+", c)),
@@ -95,11 +115,11 @@ def summarize(rows, metric="mse"):
 def order_hypothesis(groups, metric):
     """Identity gain with the original scan order vs with a shuffled scan order (S-Mamba)."""
     lines = []
-    for (data, H, model, ratio, scan, perm, tag) in sorted(groups):
-        if scan != "shuffle" or (data, H, model, ratio, "fixed", perm, tag) not in groups:
+    for (data, H, model, ratio, scan, perm, tag, hp) in sorted(groups, key=by_config):
+        if scan != "shuffle" or (data, H, model, ratio, "fixed", perm, tag, hp) not in groups:
             continue
-        fixed = groups[(data, H, model, ratio, "fixed", perm, tag)]
-        shuf = groups[(data, H, model, ratio, scan, perm, tag)]
+        fixed = groups[(data, H, model, ratio, "fixed", perm, tag, hp)]
+        shuf = groups[(data, H, model, ratio, scan, perm, tag, hp)]
         if not all(k in g for g in (fixed, shuf) for k in ("none", "add")):
             continue
         g_fixed = paired(fixed["add"], fixed["none"], metric)

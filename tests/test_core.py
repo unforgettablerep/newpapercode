@@ -135,6 +135,32 @@ def test_torch_mamba_is_causal():
     assert torch.all(d[:7] == 0) and d[7] > 0
 
 
+def test_official_configs_per_horizon_and_legacy_table():
+    from idembed.configs import changed, get_config
+    t = get_config("smamba", "Traffic", 720)
+    assert (t["lr"], t["epochs"], t["d_state"], t["batch_size"]) == (8e-4, 10, 32, 16)
+    assert get_config("smamba", "Electricity", 96)["d_state"] == 16
+    assert get_config("smamba", "Electricity", 336)["lr"] == 5e-4
+    assert get_config("itransformer", "ETTh1", 336)["d_model"] == 512
+    assert get_config("itransformer", "ETTh1", 96)["d_model"] == 256
+    legacy = get_config("smamba", "Traffic", 720, "legacy")
+    assert (legacy["lr"], legacy["epochs"], legacy["d_state"]) == (1e-3, 5, 16)
+    assert not changed("smamba", "Weather", 336) and not changed("itransformer", "Weather", 96)
+    assert changed("itransformer", "Exchange", 336) == {"epochs": (10, 1)}
+
+
+def test_summary_pairs_only_identical_training_settings():
+    sys.path.insert(0, str(ROOT / "tools"))
+    from summarize import summarize
+    base = dict(data="X", pred_len=96, model="smamba", identity="none", id_rank=8, id_loc="input",
+                id_dropout=0.0, lr=1e-3, epochs=5, mse=1.0, mae=1.0)
+    rows = [dict(base, seed=s) for s in (0, 1)] + [dict(base, seed=s, identity="add", mse=0.9)
+                                                   for s in (0, 1)]
+    rows += [dict(r, epochs=10, mse=r["mse"] * 2) for r in rows[:2]]   # other settings, no "add"
+    out = summarize(rows)
+    assert "epochs=5" in out and "epochs=10" in out and out.count("-10.00% (2/2 better)") == 1
+
+
 def test_official_split_borders():
     assert borders("ett_hour", 17420, 96) == ([0, 8544, 11424], [8640, 11520, 14400])
     n = 26304

@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from summarize import variant  # noqa: E402
+from summarize import by_config, training, variant  # noqa: E402
 
 
 def spearman(a, b):
@@ -53,10 +53,10 @@ def main():
             if "per_var" not in r:
                 continue
             key = (r["data"], r["pred_len"], r["model"], r.get("scan_order", "fixed"),
-                   r.get("var_perm", -1), r.get("epochs"), r.get("tag", ""))
+                   r.get("var_perm", -1), r.get("epochs"), r.get("tag", ""), training(r))
             groups[key].setdefault(variant(r), {})[r["seed"]] = r["per_var"]
-    for key in sorted(groups):
-        data, H, model, scan, perm, epochs, tag = key
+    for key in sorted(groups, key=by_config):
+        data, H, model, scan, perm, epochs, tag, _ = key
         base = groups[key].get("none")
         if not base:
             continue
