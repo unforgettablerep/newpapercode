@@ -175,6 +175,8 @@ scripts/          download_data.sh  check_env.py  run_quick.sh  run_main.sh  run
 tools/            summarize.py（结果汇总与判定）  analyze_identity.py（身份嵌入的可解释性）
                   per_variable.py（逐变量误差分析）  drift_gate_pilot.py（漂移路由的先导分析）
 tests/            test_core.py
+analysis/         newpaper README 中数字的分析脚本（见 analysis/README.md）
+experiments_sim/  候选方向可行性的沙盒模拟（合成数据，CPU）
 experiments_cpu/  前期 CPU 探索实验（合成数据 Hub-SSM / 稀疏混合，真实数据上的改进对比），从 paperlib 迁入
 ```
 
