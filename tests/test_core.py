@@ -42,6 +42,53 @@ def test_shapes_with_and_without_marks_and_subsets(backbone):
     assert model(x[..., idx], None, idx).shape == (2, 8, 2)
 
 
+@pytest.mark.parametrize("backbone", ["smamba", "itransformer"])
+def test_channel_norm_and_cycles_start_as_the_original_model(backbone):
+    base = small_model(backbone).eval()
+    full = small_model(backbone, "add", cn=True, rcf_cycle=6).eval()
+    x, m, phase = torch.randn(3, 24, 5), torch.randn(3, 24, 4), torch.tensor([0, 7, 30])
+    with torch.no_grad():
+        assert torch.allclose(base(x, m), full(x, m, None, phase), atol=1e-5)
+    # the shared parameters are the original ones (same initialisation, same names)
+    shared = {k: v for k, v in full.state_dict().items() if not k.endswith(("d_weight", "d_bias"))
+              and not k.startswith(("cycle.", "identity."))}
+    assert all(torch.equal(v, base.state_dict()[k]) for k, v in shared.items())
+
+
+@pytest.mark.parametrize("backbone", ["smamba", "itransformer"])
+def test_keep_zero_switches_every_variable_specific_part_off(backbone):
+    full = small_model(backbone, "add", cn=True, rcf_cycle=6).eval()
+    with torch.no_grad():
+        for name, p_ in full.named_parameters():
+            if name.endswith(("d_weight", "d_bias")) or name.startswith(("cycle.", "identity.")):
+                p_.normal_()
+    bare = small_model(backbone, "add", cn=True, rcf_cycle=6).eval()     # all offsets zero
+    with torch.no_grad():
+        for name, p_ in bare.named_parameters():                       # same shared weights
+            if not (name.endswith(("d_weight", "d_bias")) or name.startswith(("cycle.", "identity."))):
+                p_.copy_(dict(full.named_parameters())[name])
+    x, m, phase = torch.randn(3, 24, 5), torch.randn(3, 24, 4), torch.tensor([1, 2, 3])
+    keep = torch.ones(3, 5)
+    keep[1, 2] = 0
+    with torch.no_grad():
+        on, off = full(x, m, None, phase, keep), bare(x, m, None, phase)
+        assert not torch.allclose(full(x, m, None, phase), off, atol=1e-4)
+        assert torch.allclose(full(x, m, None, phase, torch.zeros(3, 5)), off, atol=1e-5)
+        ref = full(x, m, None, phase)                  # gating is per sample
+        assert torch.allclose(on[[0, 2]], ref[[0, 2]], atol=1e-6)
+        assert not torch.allclose(on[1], ref[1], atol=1e-6)
+
+
+def test_recurrent_cycle_phase():
+    from idembed.components import RecurrentCycle
+    rc = RecurrentCycle(2, 5)
+    with torch.no_grad():
+        rc.data.copy_(torch.arange(10.).view(5, 2))
+    c = rc(torch.tensor([3]), 4, 3)                     # steps 7, 8, 9 -> cycle positions 2, 3, 4
+    assert torch.equal(c[0, :, 0], torch.tensor([4., 6., 8.]))
+    assert torch.equal(rc(torch.tensor([3]), 4, 3, torch.tensor([1]))[0, :, 0], torch.tensor([5., 7., 9.]))
+
+
 def test_identity_changes_output_once_trained():
     model = small_model("itransformer", "add")
     with torch.no_grad():
@@ -197,6 +244,9 @@ def test_custom_loader_moves_target_last_and_scales(tmp_path):
     assert x.shape == (2, 24, 6) and m.shape == (2, 24, 4) and y.shape == (2, 8, 6)
     (ptrain, _, _), pcols = load_splits("PEMS08", tmp_path, 24, 8)
     assert ptrain.marks is None and len(pcols) == 7
+    b1, _ = borders("custom", 2000, 24)                  # splits know their absolute position
+    assert [sp.offset for sp in (train, val, test)] == b1
+    assert int(test.phase(torch.tensor([5]))) == b1[2] + 5
 
 
 def test_fixed_variable_permutation(tmp_path):
@@ -230,10 +280,19 @@ def test_end_to_end_cli(tmp_path):
                  ["--model", "smamba", "--identity", "none", "--per-var", "--var-perm", "1"],
                  ["--model", "smamba", "--identity", "add", "--per-var", "--var-perm", "1"],
                  ["--model", "smamba", "--identity", "add", "--scan-order", "shuffle",
-                  "--eval-orders", "2,3"]):
+                  "--eval-orders", "2,3"],
+                 ["--model", "itransformer", "--identity", "add", "--cn", "--rcf-cycle", "24",
+                  "--vs-dropout", "0.2", "--vs-lr-mult", "10", "--drift-gate"],
+                 ["--model", "smamba", "--identity", "add", "--cn", "--rcf-cycle", "auto",
+                  "--scan-order", "shuffle", "--eval-orders", "2", "--drift-gate"]):
         subprocess.run(common + args, check=True, cwd=ROOT, capture_output=True)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
-    assert len(rows) == 10 and all(np.isfinite(r["mse"]) for r in rows)
+    assert len(rows) == 12 and all(np.isfinite(r["mse"]) for r in rows)
+    for r in rows[10:]:
+        g = r["gate"]
+        assert g["q"] in g["val"] and r["mse_gate"] == g["test"][g["q"]] and g["gated_test"]["1.0"] == 0
+        assert g["test"]["1.0"] == pytest.approx(r["mse_orders"] if "mse_orders" in r else r["mse"], rel=1e-6)
+    assert rows[10]["rcf_cycle"] == 24 and rows[11]["rcf_cycle"] == 144 and "cn" not in rows[0]
     assert "mse_unseen" in rows[2] and "mse_seen" in rows[2]
     assert "mse_orders" in rows[3] and rows[0]["mamba_backend"] == "torch"
     assert rows[1]["mamba_backend"] is None
@@ -247,12 +306,17 @@ def test_end_to_end_cli(tmp_path):
     for skip in (["--skip-existing"], ["--skip-existing", "--seed", "1"]):   # skipped, then run
         subprocess.run(common + ["--model", "smamba", "--identity", "add"] + skip, check=True,
                        cwd=ROOT, capture_output=True)
-    assert len(out.read_text().splitlines()) == 11
+    assert len(out.read_text().splitlines()) == 13
+    subprocess.run(common + ["--model", "itransformer", "--identity", "add", "--rcf-cycle", "24",
+                             "--vs-dropout", "0.2", "--vs-lr-mult", "10", "--drift-gate",
+                             "--skip-existing"], check=True, cwd=ROOT, capture_output=True)
+    assert len(out.read_text().splitlines()) == 14      # differs from row 10 only by --cn
     summary = subprocess.run([sys.executable, str(ROOT / "tools" / "summarize.py"), str(out)],
                              check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "Weather" in summary and "scan order: shuffle" in summary
     assert "Does the fixed scan order act as an identity?" in summary
     assert "variables in random order 1" in summary and "mse_orders3" in summary
+    assert "add+cn+rcf24+vsdrop0.2+vslr10x+gate" in summary and "mse_gate" in summary
     res = subprocess.run([sys.executable, str(ROOT / "tools" / "per_variable.py"), str(out)],
                          check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "random order 1" in res and "most harmed" in res

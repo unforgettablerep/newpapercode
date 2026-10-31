@@ -98,6 +98,12 @@ LEGACY = {
 for _name in ("PEMS03", "PEMS04", "PEMS07", "PEMS08"):
     LEGACY["smamba"][_name], LEGACY["itransformer"][_name] = SMAMBA[_name], ITRANSFORMER[_name]
 
+# cycle lengths for residual cycle forecasting (`--rcf-cycle auto`), as in CycleNet: daily for
+# ETT / Weather / PEMS (24 hourly, 96 quarter-hourly, 144 ten-minute, 288 five-minute steps),
+# weekly for Electricity and Traffic (168 hourly steps); Exchange has no fixed cycle
+CYCLES = {"ETTh1": 24, "ETTh2": 24, "ETTm1": 96, "ETTm2": 96, "Weather": 144, "Electricity": 168,
+          "Traffic": 168, "Exchange": 0, "PEMS03": 288, "PEMS04": 288, "PEMS07": 288, "PEMS08": 288}
+
 HORIZONS = {"PEMS03": [12, 24, 48, 96], "PEMS04": [12, 24, 48, 96],
             "PEMS07": [12, 24, 48, 96], "PEMS08": [12, 24, 48, 96]}
 DEFAULT_HORIZONS = [96, 192, 336, 720]

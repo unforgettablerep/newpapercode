@@ -84,6 +84,7 @@ class Split:
     marks: torch.Tensor | None    # (T, M)
     seq_len: int
     pred_len: int
+    offset: int = 0               # absolute row index of the first row (for cycle phases)
 
     @property
     def n_windows(self):
@@ -97,6 +98,10 @@ class Split:
         x, y = w[:, :self.seq_len], w[:, self.seq_len:]
         m = None if self.marks is None else self.marks[t[:, :self.seq_len]]
         return x, m, y
+
+    def phase(self, starts):
+        """Absolute row index of each window's first step."""
+        return starts + self.offset
 
 
 def permutation(n, seed):
@@ -119,5 +124,6 @@ def load_splits(name, root, seq_len=96, pred_len=96, use_marks=True, device="cpu
     values = (values - mean) / std
     v = torch.from_numpy(values).to(device)
     m = torch.from_numpy(marks).to(device) if (marks is not None and use_marks) else None
-    splits = [Split(v[s:e], None if m is None else m[s:e], seq_len, pred_len) for s, e in zip(b1, b2)]
+    splits = [Split(v[s:e], None if m is None else m[s:e], seq_len, pred_len, s)
+              for s, e in zip(b1, b2)]
     return splits, cols

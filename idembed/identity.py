@@ -45,9 +45,10 @@ class VariableIdentity(nn.Module):
             return self.U @ self.V
         return None
 
-    def forward(self, h, var_idx=None):
+    def forward(self, h, var_idx=None, keep=None):
         """h: (B, n + M, D) tokens; the first n are variables (in the order of var_idx),
-        the remaining M are calendar-feature tokens, which get no identity."""
+        the remaining M are calendar-feature tokens, which get no identity. keep (B, n) in
+        [0, 1] scales each sample's identities (variable-specific dropout, drift gate)."""
         if self.mode == "none":
             return h
         E = self.weight() * self.active[:, None]
@@ -55,6 +56,8 @@ class VariableIdentity(nn.Module):
         n = E.shape[0]
         E = E.unsqueeze(0).to(h.dtype)
         if self.training and self.p_drop > 0:
-            keep = torch.rand(h.shape[0], n, 1, device=h.device) >= self.p_drop
-            E = E * keep.to(h.dtype)
+            drop = torch.rand(h.shape[0], n, 1, device=h.device) >= self.p_drop
+            E = E * drop.to(h.dtype)
+        if keep is not None:
+            E = E * keep[..., None].to(h.dtype)
         return torch.cat([h[:, :n] + E, h[:, n:]], 1)

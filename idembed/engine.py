@@ -12,6 +12,14 @@ the seen and the unseen ones. Unseen variables keep the zero identity.
 With `eval_orders`, the validation MSE of the same averaging is stored as well
 (`val_mse_orders[K]`; early stopping always uses the single original-order pass).
 
+`drift_gate`: a label-free test-time gate. A window's drift score for variable i is
+|mean| + |log std| of its look-back window in training units (the inputs are standardised with
+training statistics). Where the score exceeds a threshold, the variable-specific parts
+(identity, channel-norm offsets, cycles) are switched off for that window and variable. The
+threshold is a quantile q of the scores of training windows; q (or no gate) is chosen on the
+validation split, and the test MSE with the chosen q is stored as `mse_gate`. The test MSE of
+every q is stored under result["gate"] for analysis only.
+
 `per_var`: also store, for every variable (in the file's column order), the test and
 validation MSE and the level / scale of its validation and test splits in units of the
 training statistics, under result["per_var"].
@@ -27,6 +35,9 @@ from .data import load_splits, permutation
 from .models import VariateForecaster
 
 
+GATE_QS = (0.9, 0.95, 0.98, 0.99, 0.995, 0.999)
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -34,21 +45,45 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def drift_score(x):
+    """x: (B, L, n) standardised look-back windows -> (B, n) drift scores."""
+    sd = torch.sqrt(torch.var(x, dim=1, unbiased=False) + 1e-10)
+    return x.mean(1).abs() + torch.log(sd).abs()
+
+
 @torch.no_grad()
-def evaluate(model, split, var_idx=None, bs=256, amp_dtype=None, groups=None, per_var=False):
+def drift_thresholds(split, var_idx=None, qs=GATE_QS, n=4096):
+    """Quantiles of the drift scores of (up to n) windows of `split`."""
+    g = torch.Generator().manual_seed(0)
+    starts = torch.randperm(split.n_windows, generator=g)[:n].to(split.values.device)
+    s = drift_score(split.batch(starts, var_idx)[0].float()).flatten()
+    s = s[:: max(1, s.numel() // 4_000_000)]                    # torch.quantile size limit
+    return {q: torch.quantile(s, q).item() for q in qs}
+
+
+@torch.no_grad()
+def evaluate(model, split, var_idx=None, bs=256, amp_dtype=None, groups=None, per_var=False,
+             tau=None):
     """Returns {'mse', 'mae'} over all windows; with `groups` ({name: column positions}) also
-    per-group metrics; with `per_var` also 'mse_per_var' / 'mae_per_var' (lists)."""
+    per-group metrics; with `per_var` also 'mse_per_var' / 'mae_per_var' (lists); with a drift
+    threshold `tau` the variable-specific parts are switched off where the drift score exceeds
+    it, and 'gated' is the fraction of (window, variable) pairs switched off."""
     model.eval()
     dev = split.values.device
     se_var = ae_var = 0.0
+    n_gated = n_pairs = 0
     sums = {"all": [0.0, 0.0, 0]}
     for g in groups or {}:
         sums[g] = [0.0, 0.0, 0]
     for starts in torch.arange(split.n_windows, device=dev).split(bs):
         x, m, y = split.batch(starts, var_idx)
+        keep = None
+        if tau is not None:
+            keep = (drift_score(x) <= tau).to(x.dtype)
+            n_gated, n_pairs = n_gated + int((keep == 0).sum()), n_pairs + keep.numel()
         with torch.autocast(device_type=dev.type, dtype=amp_dtype or torch.float32,
                             enabled=amp_dtype is not None):
-            p = model(x, m, var_idx)
+            p = model(x, m, var_idx, split.phase(starts), keep)
         err = p.float() - y
         if per_var:
             se_var = se_var + (err ** 2).sum((0, 1))
@@ -63,7 +98,26 @@ def evaluate(model, split, var_idx=None, bs=256, amp_dtype=None, groups=None, pe
     if per_var:
         n = split.n_windows * split.pred_len
         out["mse_per_var"], out["mae_per_var"] = (se_var / n).tolist(), (ae_var / n).tolist()
+    if tau is not None:
+        out["gated"] = n_gated / max(n_pairs, 1)
     return out
+
+
+def drift_gate(model, train, val, test, seen, amp_dtype, orders=1):
+    """Choose the drift-gate quantile on the validation split (see the module docstring)."""
+    taus = drift_thresholds(train, seen)
+    model.set_eval_orders(orders)
+    res = {"orders": orders, "tau": {str(q): t for q, t in taus.items()},
+           "val": {}, "test": {}, "mae_test": {}, "gated_test": {}}
+    for q in (1.0,) + GATE_QS:                  # q = 1.0: no gate
+        tau = math.inf if q == 1.0 else taus[q]
+        v = evaluate(model, val, seen, amp_dtype=amp_dtype, tau=tau)
+        t = evaluate(model, test, None, amp_dtype=amp_dtype, tau=tau)
+        res["val"][str(q)], res["test"][str(q)] = v["mse"], t["mse"]
+        res["mae_test"][str(q)], res["gated_test"][str(q)] = t["mae"], t["gated"]
+    model.set_eval_orders(1)
+    res["q"] = min(res["val"], key=res["val"].get)
+    return res
 
 
 def run(cfg, log=print):
@@ -91,15 +145,19 @@ def run(cfg, log=print):
         dropout=cfg["dropout"], activation=cfg["activation"], use_norm=cfg["use_norm"],
         identity=cfg["identity"], id_rank=cfg["id_rank"], id_loc=cfg["id_loc"],
         id_dropout=cfg["id_dropout"], mamba_impl=cfg["mamba_impl"],
-        scan_order=cfg.get("scan_order", "fixed")).to(device)
+        scan_order=cfg.get("scan_order", "fixed"), cn=cfg.get("cn", False),
+        rcf_cycle=cfg.get("rcf_cycle", 0), vs_dropout=cfg.get("vs_dropout", 0.0)).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     # identity parameters start at zero and Adam moves them by about lr per step, so with the
     # small official learning rates (5e-5 .. 1e-3) they can be given a larger one
     id_params = list(model.identity.parameters())
-    id_set = {id(p) for p in id_params}
-    groups = [{"params": [p for p in model.parameters() if id(p) not in id_set], "mult": 1.0}]
+    vs_params = model.variable_specific_parameters()      # channel-norm offsets, cycles
+    own = {id(p) for p in id_params + vs_params}
+    groups = [{"params": [p for p in model.parameters() if id(p) not in own], "mult": 1.0}]
     if id_params:
         groups.append({"params": id_params, "mult": cfg.get("id_lr_mult", 1.0)})
+    if vs_params:
+        groups.append({"params": vs_params, "mult": cfg.get("vs_lr_mult", 1.0)})
     opt = torch.optim.Adam(groups, lr=cfg["lr"])
     use_scaler = amp_dtype == torch.float16 and device.type == "cuda"
     scaler = (torch.amp.GradScaler("cuda", enabled=use_scaler) if hasattr(torch.amp, "GradScaler")
@@ -122,7 +180,7 @@ def run(cfg, log=print):
             x, m, y = train.batch(starts, seen)
             with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32,
                                 enabled=amp_dtype is not None):
-                loss = F.mse_loss(model(x, m, seen).float(), y)
+                loss = F.mse_loss(model(x, m, seen, train.phase(starts)).float(), y)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -163,6 +221,10 @@ def run(cfg, log=print):
         if k == ks[-1]:                            # '_orders': the largest number of orders
             metrics.update(avg)
         model.set_eval_orders(1)
+    if cfg.get("drift_gate"):
+        gate = drift_gate(model, train, val, test, seen, amp_dtype, ks[-1] if ks else 1)
+        metrics.update(gate=gate, mse_gate=gate["test"][gate["q"]],
+                       mae_gate=gate["mae_test"][gate["q"]])
     test_time = time.time() - t1
     if per_var:
         pv = {"test_mse": metrics.pop("mse_per_var"), "test_mae": metrics.pop("mae_per_var")}
