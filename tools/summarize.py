@@ -35,13 +35,15 @@ def variant(r):
             v += f"-{r['id_loc']}"
         if r["id_dropout"]:
             v += f"-drop{r['id_dropout']}"
-        if r.get("id_lr_mult", 1.0) != 1.0:
-            v += f"-lr{r['id_lr_mult']:g}x"
+        m = r.get("id_lr_mult", 1.0)
+        if m != 1.0:
+            v += "-lrauto" if m == "auto" else f"-lr{m:g}x"
     # further per-variable components (not present in earlier result files)
     v += "+cn" if r.get("cn") else ""
-    v += f"+rcf{r['rcf_cycle']}" if r.get("rcf_cycle") else ""
+    v += (f"+rcf{r['rcf_cycle']}" + ("sh" if r.get("rcf_shared") else "")) if r.get("rcf_cycle") else ""
     v += f"+vsdrop{r['vs_dropout']}" if r.get("vs_dropout") else ""
-    v += f"+vslr{r['vs_lr_mult']:g}x" if r.get("vs_lr_mult", 1.0) != 1.0 else ""
+    vm = r.get("vs_lr_mult", 1.0)
+    v += ("+vslrauto" if vm == "auto" else f"+vslr{vm:g}x") if vm != 1.0 else ""
     v += "+gate" if r.get("drift_gate") else ""
     return v
 
@@ -91,7 +93,8 @@ def summarize(rows, metric="mse"):
                        key=lambda c: int(c[10:]))
         has_orders = "mse_orders" in present
         cols = (["mse", "mae"] + (sweep or (["mse_orders", "mae_orders"] if has_orders else []))
-                + (["mse_gate", "mae_gate"] if "mse_gate" in present else [])
+                + (["mse_gate", "mse_gate_hard"] if "mse_gate" in present else [])
+                + (["mse_rand1"] if "mse_rand1" in present else [])
                 + (["mse_seen", "mse_unseen"] if ratio < 1 else []))
         out += [title, "", "| variant | " + " | ".join(cols) + " | seeds | vs none (paired MSE) | verdict |",
                 "|---|" + "---|" * (len(cols) + 3)]

@@ -100,7 +100,7 @@ class MambaLayer(nn.Module):
         super().__init__()
         if scan_order not in ("fixed", "shuffle"):
             raise ValueError(scan_order)
-        self.scan_order, self.eval_orders = scan_order, 1
+        self.scan_order, self.eval_orders, self.eval_seed = scan_order, 1, None
         self.fwd = build_mamba(d_model, d_state, d_conv=2, expand=1, impl=mamba_impl)
         self.bwd = build_mamba(d_model, d_state, d_conv=2, expand=1, impl=mamba_impl)
         self.ffn = FeedForward(d_model, d_ff, dropout, activation)
@@ -122,6 +122,9 @@ class MambaLayer(nn.Module):
             m = torch.stack([self.mix(x, torch.randperm(T, generator=g).to(x.device))
                              for _ in range(self.eval_orders)]).mean(0)
             x = apply_norm(self.norm1, x + m, var_idx, keep)
+        elif not self.training and self.eval_seed is not None:      # one random order
+            perm = torch.randperm(T, generator=torch.Generator().manual_seed(self.eval_seed))
+            x = apply_norm(self.norm1, x + self.mix(x, perm.to(x.device)), var_idx, keep)
         else:                                       # original order, same arithmetic as S-Mamba
             x = apply_norm(self.norm1, x + self.fwd(x) + self.bwd(x.flip(1)).flip(1), var_idx, keep)
         return apply_norm(self.norm2, x + self.ffn(x), var_idx, keep)
@@ -131,7 +134,7 @@ class VariateForecaster(nn.Module):
     def __init__(self, backbone, n_vars, seq_len, pred_len, d_model=512, d_ff=512, e_layers=2,
                  n_heads=8, d_state=16, dropout=0.1, activation="gelu", use_norm=True,
                  identity="none", id_rank=8, id_loc="input", id_dropout=0.0, mamba_impl="auto",
-                 scan_order="fixed", cn=False, rcf_cycle=0, vs_dropout=0.0):
+                 scan_order="fixed", cn=False, rcf_cycle=0, vs_dropout=0.0, rcf_shared=False):
         super().__init__()
         self.use_norm, self.pred_len, self.id_loc = use_norm, pred_len, id_loc
         self.seq_len, self.vs_dropout = seq_len, vs_dropout
@@ -154,7 +157,7 @@ class VariateForecaster(nn.Module):
         # created last so that the other layers get exactly the original initialisation
         self.identity = nn.ModuleList(VariableIdentity(n_vars, d_model, identity, id_rank, id_dropout)
                                       for _ in range(n_id))
-        self.cycle = RecurrentCycle(n_vars, rcf_cycle) if rcf_cycle else None
+        self.cycle = RecurrentCycle(n_vars, rcf_cycle, rcf_shared) if rcf_cycle else None
 
     def forward(self, x, x_mark=None, var_idx=None, phase=None, keep=None):
         """x: (B, L, n) with the variables listed in var_idx (default: all, in order).
@@ -173,7 +176,8 @@ class VariateForecaster(nn.Module):
             if phase is None:
                 raise ValueError("rcf_cycle needs the window phase")
             c = self.cycle(phase, 0, self.seq_len, var_idx)
-            x = x - (c if keep is None else c * keep[:, None])
+            x = (x - (c if keep is None else c * keep[:, None])
+                 - self.cycle.shared_part(phase, 0, self.seq_len))
         h = self.embedding(x, x_mark)
         if self.id_loc == "input":
             h = self.identity[0](h, var_idx, keep)
@@ -184,13 +188,21 @@ class VariateForecaster(nn.Module):
         out = self.projector(apply_norm(self.norm, h, var_idx, keep)).permute(0, 2, 1)[:, :, :n]
         if self.cycle is not None:
             c = self.cycle(phase, self.seq_len, self.pred_len, var_idx)
-            out = out + (c if keep is None else c * keep[:, None])
+            out = (out + (c if keep is None else c * keep[:, None])
+                   + self.cycle.shared_part(phase, self.seq_len, self.pred_len))
         if self.use_norm:
             out = out * sd + mu
         return out
 
+    def set_eval_seed(self, seed):
+        """Evaluate S-Mamba in one random scan order drawn with this seed (None = original)."""
+        for layer in self.layers:
+            if isinstance(layer, MambaLayer):
+                layer.eval_seed = seed
+
     def variable_specific_parameters(self):
-        """Channel-norm offsets and cycles (the identity tables are handled separately)."""
+        """Zero-initialised parameters besides the identity tables: channel-norm offsets and
+        cycles (including a shared cycle); they get their own learning-rate multiplier."""
         return [p for name, p in self.named_parameters()
                 if name.endswith(("d_weight", "d_bias")) or name.startswith("cycle.")]
 

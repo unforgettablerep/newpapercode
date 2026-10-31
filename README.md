@@ -33,8 +33,10 @@ h_i = Linear(x_i) + e_i ,   i = 1..N      （e_i 从 0 开始学习）
 | `--cn` | 通道归一化（Lee 等，ICML 2025）：每个编码层的 LayerNorm 改为"共享仿射 + 每个变量的偏移"，偏移从 0 开始，初始化时与原模型相同 |
 | `--rcf-cycle W` / `auto` | 残差周期预测（CycleNet，NeurIPS 2024）：每个变量一条长度为 W 的可学习周期，从归一化后的输入中减去、再加回预测；`auto` 取 `idembed/configs.py` 中的周期（ETTh 24、ETTm 96、Weather 144、Electricity/Traffic 168、PEMS 288） |
 | `--vs-dropout p` | 训练时以概率 p 把某个变量的所有变量特有部分（身份、通道归一化偏移、周期）一起关掉，使模型也能在没有它们时预测这个变量 |
-| `--vs-lr-mult m` | 通道归一化偏移和周期参数的学习率倍数 |
-| `--drift-gate` | 无标签的测试时门控：某个窗口中，变量的回看段相对训练期的漂移分数（\|均值\| + \|log 标准差\|，以训练统计量为单位）超过阈值时，关掉该变量的变量特有部分。阈值取训练窗口漂移分数的分位数 q，q（或不门控）在验证集上选择；结果记为 `mse_gate` / `mae_gate`，各 q 的测试结果另存在 `gate` 中，仅供分析 |
+| `--vs-lr-mult m` / `auto` | 通道归一化偏移和周期参数的学习率倍数。`auto`（`--id-lr-mult` 也可用）取 max(1, 1/B)，B = lr·S·(3 − 2^(2−E)) 是从零开始的参数在计划的 E 轮、每轮 S 步内的学习预算（Adam 下的最大位移），见 newpaper `papers/theory.md` §5 |
+| `--rcf-shared` | 周期 = 共享周期 + 逐变量偏移；门控和变量特有 dropout 只关偏移，共享周期保留（theory §6） |
+| `--order-probe R` | S-Mamba：另在 R 个单独的随机扫描顺序下测试（`mse_rand1` 为平均），检验"一个随机顺序是否就够"（theory §7） |
+| `--drift-gate` | 无标签的测试时门控，同一次运行评估两种，阈值都在验证集上选择（含"不门控"），各候选的测试结果存在 `gate` 中，仅供分析。**后验门控**（`mse_gate`，theory §6 推导）：窗口统计量（均值，log 标准差）相对该变量自身训练窗口分布的马氏距离 D²，持续后验 w = σ((c − D²)/2)，预测 = w·（变量特有部分全开）+ (1 − w)·（关掉 D² > c 的变量），c 取卡方(2)分位数。**硬门控**（`mse_gate_hard`）：\|均值\| + \|log 标准差\| 超过训练窗口分数的分位数时关掉 |
 | `--skip-existing` | `--out` 中已有完全相同配置的运行时直接跳过，脚本中断后可以原样重新执行 |
 | `--per-var` | 结果中额外记录每个变量（按文件列顺序）的测试 / 验证 MSE，以及验证段、测试段相对训练段的均值与标准差（`result["per_var"]`），供 `tools/per_variable.py` 分析 |
 
@@ -94,7 +96,7 @@ python run.py --model smamba --data Electricity --train-var-ratio 0.4 --identity
 | `scripts/run_shuffle_main.sh` | S-Mamba 随机扫描顺序训练 × {无, 有身份} × 全部 8 个数据集 × 全部预测长度，测试时报告原始顺序和 2 / 4 / 8 个顺序平均；固定顺序的对照复用 `run_main.sh` 的结果 | 192 |
 | `scripts/run_official.sh` | 超参数改为官方逐预测长度设置后，重跑设置有变化的 25 个（骨架, 数据集, 预测长度）组合：{无, 有身份, 身份学习率 ×10（学习率不超过 1e-4 时）}，S-Mamba 另加随机扫描顺序 {无, 有身份}；3 个种子 | 336 |
 | `scripts/run_dropout.sh` | Electricity、Traffic × 全部预测长度 × 两种骨架：身份 dropout 0.1 / 0.3；S-Mamba 另加随机扫描顺序 + 身份 dropout 0.1；3 个种子 | 120 |
-| `scripts/run_combo.sh` | 组合模型的筛选（预测 96 步，3 个种子；`HORIZONS` 可扩展到其他长度）：Electricity、Traffic、Weather、ETTh1 × 两种骨架 ×｛基线、完整模型、完整模型分别去掉身份 / 通道归一化 / 周期 / 变量特有 dropout（S-Mamba 还有去掉随机扫描顺序）｝；学习率不超过 1e-4 的数据集另跑完整模型 + 变量特有参数学习率 ×10。完整模型 = 身份 + 通道归一化 + 周期 + 变量特有 dropout 0.1 + 漂移门控（S-Mamba 另加随机扫描顺序和 2 个顺序平均） | 168 |
+| `scripts/run_theory.sh` | 检验 newpaper `papers/theory.md` 的预测（预测 96 步，3 个种子；`HORIZONS` 可扩展）：Electricity、Traffic、Weather、ETTh1 × 两种骨架 ×｛基线、身份、CN、CN + 身份（P2）、推导出的模型（CN + 分层周期 + 变量特有 dropout + 门控，预算归一化学习率）、它 + 身份、改用逐变量周期（P3）｝；S-Mamba 用随机扫描顺序并做顺序探测（P6），另跑固定顺序的推导模型；学习率不超过 1e-4 的数据集另跑学习率 ×1 的推导模型（P4）；门控的三种情况（P5）在同一次运行中评估 | 192 |
 | `scripts/run_recipe.sh` | 候选最终方案在其余 6 个数据集（ETT 四个、Exchange、Weather）× 全部预测长度上的运行：iTransformer 身份 + dropout 0.3（身份学习率 ×1 / ×10），S-Mamba 随机扫描顺序 + 身份 + dropout 0.1（K=2/8）；3 个种子 | 216 |
 
 可以用环境变量缩小范围，例如 `DATASETS="Electricity Traffic" SEEDS="0" bash scripts/run_main.sh`。运行时间主要花在 Traffic、Electricity 和 PEMS07 上。
@@ -146,7 +148,7 @@ python -m pytest -q tests        # CPU 上约 1 分钟
 - 随机扫描顺序只影响训练和多顺序平均的测试，按原始顺序测试时与固定顺序模型完全相同；
 - 官方划分边界、目标列后移和标准化；
 - 官方逐预测长度超参数与 legacy 表；汇总只配对训练设置相同的运行；
-- 通道归一化、残差周期在初始化时与原模型一致；`keep = 0` 时所有变量特有部分都被关掉，且门控按样本独立；周期的相位按数据中的绝对位置计算；漂移门控的端到端运行；`--skip-existing` 区分只在使用时才记录的选项；
+- 通道归一化、残差周期在初始化时与原模型一致；`keep = 0` 时所有变量特有部分都被关掉、共享周期保留，且门控按样本独立；周期的相位按数据中的绝对位置计算；后验门控的权重；两种门控、顺序探测、自动学习率倍数的端到端运行；`--skip-existing` 区分只在使用时才记录的选项；
 - 固定随机变量排列（`--var-perm`）与逐变量结果（`--per-var`，按文件列顺序还原，逐变量 MSE 的平均等于总 MSE）；
 - 命令行端到端运行，以及汇总、分析工具。
 
@@ -158,7 +160,7 @@ python -m pytest -q tests        # CPU 上约 1 分钟
 - **加入了随机扫描顺序选项**，用来检验"S-Mamba 的提升比 iTransformer 小，是因为固定扫描顺序已经起到了一部分身份作用"这一推测（`scripts/run_order.sh`）。固定顺序时，加入该选项前后的计算逐位相同，所以新实验可以直接和已有的快速实验结果配对比较。
 - **`run_order.sh`、`run_ablation.sh`、`run_main.sh` 已在 4090 上完成**，结果与分析见 newpaper 仓库的 README（实验 2–4）。主要发现：身份嵌入在 Weather、Electricity 的所有预测长度上有效（iTransformer −2.4%～−7.7%，S-Mamba 较小），在 ETT、Exchange 上无作用，在 Traffic 上 MSE 变差 1.5%～6.9%；随机扫描顺序实验证实固定扫描顺序起到了隐式身份的作用；Weather 上身份学习率 ×10 使 S-Mamba 的收益从 −1.8% 增大到 −5.9%。
 - **`run_traffic.sh`、`run_perm.sh`、`run_idlr.sh`、`run_shuffle_main.sh` 已完成**（newpaper README 实验 5–8）。逐项核对官方脚本后发现，legacy 表在 25 个（骨架, 数据集, 预测长度）组合上与官方设置不同（见第 5 节），其中 Traffic 上的 S-Mamba 只训练了 5 轮（官方 10 轮）。超参数表已改为官方设置，`run_official.sh` 重跑这些组合，`run_dropout.sh` 在 Electricity、Traffic 的全部预测长度上测试身份 dropout。默认设置未变的组合，计算与之前逐位相同（主表的 197 次重跑与原结果相差不超过 0.0014%）。
-- **研究方向调整为应用导向的组合模型**（newpaper `papers/new_directions.md`、README 第四阶段）：在身份嵌入之外加入通道归一化、残差周期、变量特有 dropout 和无标签漂移门控，筛选脚本为 `run_combo.sh`。默认设置下的计算与之前逐位相同（已与 `fddb550` 对照）。
+- **研究方向调整为应用导向的组合模型，并先做理论推导**（newpaper `papers/theory.md`）：各模块的形式由推导决定——变量特有参数都写成"共享 + 零初始化偏移"、学习率按学习预算归一化、门控取逐变量马氏距离的后验并在输出空间混合、周期分层。原先直接堆叠模块的 `run_combo.sh` 已删除，改为检验推导预测的 `run_theory.sh`。默认设置下的计算与之前逐位相同（已与 `fddb550` 对照）。
 - **`run_official.sh`（Traffic 上 S-Mamba 的 192/336/720 尚未跑完）和 `run_dropout.sh` 已完成**（newpaper README 实验 9–10）。为下一轮加入了 `--skip-existing`（`run_official.sh`、`run_dropout.sh`、`run_recipe.sh` 默认使用，中断后可原样重跑；`run_official.sh` 还可用 `HORIZONS` 限定预测长度）、随机顺序模型的多顺序验证 MSE，以及 `run_recipe.sh`。
 - **上一轮加入了**：逐变量误差记录（`--per-var`）与分析工具 `tools/per_variable.py`、固定随机变量排列（`--var-perm`）、一次运行测试多个顺序数（`--eval-orders 2,4,8`），以及脚本 `run_traffic.sh`、`run_perm.sh`、`run_idlr.sh`、`run_shuffle_main.sh`。
 
@@ -169,7 +171,7 @@ idembed/          data.py（数据与划分） identity.py（身份嵌入） com
                   models.py（iTransformer、S-Mamba） engine.py（训练与评估） configs.py（超参数与来源）
 run.py            单次运行的命令行入口
 scripts/          download_data.sh  check_env.py  run_quick.sh  run_main.sh  run_ablation.sh  run_order.sh
-                  run_traffic.sh  run_perm.sh  run_idlr.sh  run_shuffle_main.sh  run_official.sh  run_dropout.sh  run_recipe.sh  run_combo.sh
+                  run_traffic.sh  run_perm.sh  run_idlr.sh  run_shuffle_main.sh  run_official.sh  run_dropout.sh  run_recipe.sh  run_theory.sh
 tools/            summarize.py（结果汇总与判定）  analyze_identity.py（身份嵌入的可解释性）
                   per_variable.py（逐变量误差分析）  drift_gate_pilot.py（漂移路由的先导分析）
 tests/            test_core.py

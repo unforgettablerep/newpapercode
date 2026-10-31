@@ -35,8 +35,9 @@ def parse():
     ap.add_argument("--id-rank", type=int, default=8)
     ap.add_argument("--id-loc", choices=["input", "every"], default="input")
     ap.add_argument("--id-dropout", type=float, default=0.0)
-    ap.add_argument("--id-lr-mult", type=float, default=1.0,
-                    help="learning-rate multiplier for the identity parameters")
+    ap.add_argument("--id-lr-mult", default="1",
+                    help="learning-rate multiplier for the identity parameters; 'auto' = "
+                         "max(1, 1 / learning budget)")
     ap.add_argument("--train-var-ratio", type=float, default=1.0,
                     help="train/validate on this fraction of the variables, test on all")
     # S-Mamba scan order
@@ -54,11 +55,16 @@ def parse():
     ap.add_argument("--vs-dropout", type=float, default=0.0,
                     help="switch all variable-specific parts of a variable off with this "
                          "probability per sample during training")
-    ap.add_argument("--vs-lr-mult", type=float, default=1.0,
-                    help="learning-rate multiplier for channel-norm offsets and cycles")
+    ap.add_argument("--vs-lr-mult", default="1",
+                    help="learning-rate multiplier for channel-norm offsets and cycles; 'auto' "
+                         "as for --id-lr-mult")
+    ap.add_argument("--rcf-shared", action="store_true",
+                    help="cycles = shared cycle + per-variable offsets (only offsets are gated)")
+    ap.add_argument("--order-probe", type=int, default=0,
+                    help="S-Mamba: also test in this many single random scan orders")
     ap.add_argument("--drift-gate", action="store_true",
-                    help="label-free test-time gate: switch the variable-specific parts off for "
-                         "drifting windows; the threshold is chosen on the validation split")
+                    help="label-free test-time gates (posterior and hard) for the variable-specific "
+                         "parts of drifting windows; thresholds chosen on the validation split")
     ap.add_argument("--var-perm", type=int, default=None,
                     help="list the variables in a fixed random order (this seed) instead of the "
                          "file's column order")
@@ -86,11 +92,12 @@ def parse():
 def main():
     a = parse()
     ks = [int(k) for k in a.eval_orders.split(",")]
+    lr_mult = lambda m: m if m == "auto" else float(m)
     eval_orders = ks[0] if len(ks) == 1 else ks
     cfg = get_config(a.model, a.data, a.pred_len, a.config)
     cfg.update(model=a.model, data=a.data, root_path=a.root_path, pred_len=a.pred_len, seed=a.seed,
                identity=a.identity, id_rank=a.id_rank, id_loc=a.id_loc, id_dropout=a.id_dropout,
-               id_lr_mult=a.id_lr_mult, scan_order=a.scan_order, eval_orders=eval_orders,
+               id_lr_mult=lr_mult(a.id_lr_mult), scan_order=a.scan_order, eval_orders=eval_orders,
                train_var_ratio=a.train_var_ratio, use_marks=not a.no_marks,
                amp=a.amp, tf32=a.tf32, mamba_impl=a.mamba_impl, device=a.device, tag=a.tag)
     if a.no_norm:
@@ -100,7 +107,9 @@ def main():
     # new options are stored only when used, so that earlier result files stay comparable
     rcf = CYCLES.get(a.data, 0) if a.rcf_cycle == "auto" else int(a.rcf_cycle)
     for k, v, default in (("cn", a.cn, False), ("rcf_cycle", rcf, 0), ("vs_dropout", a.vs_dropout, 0.0),
-                          ("vs_lr_mult", a.vs_lr_mult, 1.0), ("drift_gate", a.drift_gate, False)):
+                          ("vs_lr_mult", lr_mult(a.vs_lr_mult), 1.0), ("drift_gate", a.drift_gate, False),
+                          ("rcf_shared", a.rcf_shared and rcf > 0, False),
+                          ("order_probe", a.order_probe, 0)):
         if v != default:
             cfg[k] = v
     if a.per_var:
@@ -113,8 +122,10 @@ def main():
     print(json.dumps({k: cfg[k] for k in sorted(cfg)}))
     if a.skip_existing and Path(a.out).exists():
         # options stored only when used must also match when they are absent from cfg
-        optional = ("var_perm", "cn", "rcf_cycle", "vs_dropout", "vs_lr_mult", "drift_gate")
-        same = lambda r: (all(r.get(k) == v for k, v in cfg.items())
+        optional = ("var_perm", "cn", "rcf_cycle", "vs_dropout", "vs_lr_mult", "drift_gate",
+                    "rcf_shared", "order_probe")
+        # per_var only adds logging (and the result stores the per-variable errors under it)
+        same = lambda r: (all(r.get(k) == v for k, v in cfg.items() if k != "per_var")
                           and all(r.get(k) == cfg.get(k) for k in optional))
         with open(a.out) as f:
             if any(same(json.loads(line)) for line in f if line.strip()):
@@ -127,9 +138,12 @@ def main():
     print(f"test mse {result['mse']:.4f}  mae {result['mae']:.4f}  (best epoch {result['best_epoch']}, "
           f"mamba backend {result['mamba_backend']})")
     if "mse_gate" in result:
-        g = result["gate"]
-        print(f"drift gate (q = {g['q']} chosen on validation, {g['gated_test'][g['q']]:.2%} of test "
-              f"pairs gated): mse {result['mse_gate']:.4f}  mae {result['mae_gate']:.4f}")
+        for mode, key in (("posterior", "mse_gate"), ("hard", "mse_gate_hard")):
+            g = result["gate"][mode]
+            print(f"{mode} drift gate ({g['q']} chosen on validation, {g['gated_test'][g['q']]:.2%} "
+                  f"of test pairs gated): mse {result[key]:.4f}")
+    if "mse_rand1" in result:
+        print(f"single random scan orders: mse {result['mse_rand1']:.4f} (mean of {a.order_probe})")
     for k in sorted(k for k in ks if k > 1):
         sfx = f"_orders{k}" if f"mse_orders{k}" in result else "_orders"
         print(f"averaged over {k} scan orders: mse {result['mse' + sfx]:.4f}  "

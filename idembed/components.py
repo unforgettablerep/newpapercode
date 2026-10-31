@@ -6,7 +6,9 @@
   shared affine (keep = 0).
 - RecurrentCycle: learnable per-variable cycles of length W (residual cycle forecasting,
   CycleNet, Lin et al., NeurIPS 2024). The cycle is removed from the normalised input and added
-  back to the forecast; it starts at zero, so at initialisation the model is unchanged.
+  back to the forecast; it starts at zero, so at initialisation the model is unchanged. With
+  `shared`, the cycle is a shared cycle plus per-variable offsets, and only the offsets are
+  variable-specific (papers/theory.md in the newpaper repository, D1).
 
 Both take `keep` (B, n) in [0, 1]: 0 switches the variable-specific part off for that sample
 and variable (variable-specific dropout during training, the drift gate at test time).
@@ -41,14 +43,21 @@ class ChannelNorm(nn.Module):
 
 
 class RecurrentCycle(nn.Module):
-    def __init__(self, n_vars, cycle):
+    def __init__(self, n_vars, cycle, shared=False):
         super().__init__()
         self.cycle = cycle
         self.data = nn.Parameter(torch.zeros(cycle, n_vars))
+        self.shared = nn.Parameter(torch.zeros(cycle, 1)) if shared else None
+
+    def index(self, phase, start, length):
+        return (phase[:, None] + start + torch.arange(length, device=phase.device)) % self.cycle
 
     def forward(self, phase, start, length, var_idx=None):
         """phase: (B,) absolute index of each window's first step. Returns (B, length, n), the
-        cycle values at steps start .. start + length - 1 of each window."""
-        idx = (phase[:, None] + start + torch.arange(length, device=phase.device)) % self.cycle
+        variable-specific cycle values at steps start .. start + length - 1 of each window."""
         q = self.data if var_idx is None else self.data[:, var_idx]
-        return q[idx]
+        return q[self.index(phase, start, length)]
+
+    def shared_part(self, phase, start, length):
+        """(B, length, 1) values of the shared cycle, or 0 without one."""
+        return 0.0 if self.shared is None else self.shared[self.index(phase, start, length)]

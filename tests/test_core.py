@@ -79,6 +79,33 @@ def test_keep_zero_switches_every_variable_specific_part_off(backbone):
         assert not torch.allclose(on[1], ref[1], atol=1e-6)
 
 
+def test_shared_cycle_is_kept_when_the_variable_parts_are_switched_off():
+    m = small_model("itransformer", "none", rcf_cycle=6, rcf_shared=True).eval()
+    with torch.no_grad():
+        m.cycle.shared.normal_()
+        m.cycle.data.normal_()
+    ref = small_model("itransformer", "none", rcf_cycle=6, rcf_shared=True).eval()
+    with torch.no_grad():
+        ref.cycle.shared.copy_(m.cycle.shared)                 # same shared cycle, no offsets
+    x, phase = torch.randn(2, 24, 5), torch.tensor([3, 4])
+    with torch.no_grad():
+        assert torch.allclose(m(x, None, None, phase, torch.zeros(2, 5)), ref(x, None, None, phase),
+                              atol=1e-6)
+        assert not torch.allclose(ref(x, None, None, phase), small_model("itransformer").eval()(x),
+                                  atol=1e-4)
+
+
+def test_posterior_gate_weights():
+    from idembed.engine import posterior_gate, window_stats
+    mu, icov = torch.zeros(2, 2), torch.eye(2).repeat(2, 1, 1)
+    torch.manual_seed(0)
+    x = torch.randn(1, 96, 2)                           # mean ~0, log std ~0: D2 ~ 0
+    x[..., 1] += 10.0                                   # variable 1 far from its training stats
+    keep, w = posterior_gate(9.21, mu, icov)(x)
+    assert keep.tolist() == [[1.0, 0.0]] and w[0, 0] > 0.95 and w[0, 1] < 1e-6
+    assert window_stats(x).shape == (1, 2, 2)
+
+
 def test_recurrent_cycle_phase():
     from idembed.components import RecurrentCycle
     rc = RecurrentCycle(2, 5)
@@ -284,14 +311,22 @@ def test_end_to_end_cli(tmp_path):
                  ["--model", "itransformer", "--identity", "add", "--cn", "--rcf-cycle", "24",
                   "--vs-dropout", "0.2", "--vs-lr-mult", "10", "--drift-gate"],
                  ["--model", "smamba", "--identity", "add", "--cn", "--rcf-cycle", "auto",
-                  "--scan-order", "shuffle", "--eval-orders", "2", "--drift-gate"]):
+                  "--scan-order", "shuffle", "--eval-orders", "2", "--drift-gate"],
+                 ["--model", "smamba", "--identity", "none", "--cn", "--rcf-cycle", "24",
+                  "--rcf-shared", "--vs-lr-mult", "auto", "--id-lr-mult", "auto",
+                  "--scan-order", "shuffle", "--order-probe", "2"]):
         subprocess.run(common + args, check=True, cwd=ROOT, capture_output=True)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
-    assert len(rows) == 12 and all(np.isfinite(r["mse"]) for r in rows)
-    for r in rows[10:]:
-        g = r["gate"]
-        assert g["q"] in g["val"] and r["mse_gate"] == g["test"][g["q"]] and g["gated_test"]["1.0"] == 0
-        assert g["test"]["1.0"] == pytest.approx(r["mse_orders"] if "mse_orders" in r else r["mse"], rel=1e-6)
+    assert len(rows) == 13 and all(np.isfinite(r["mse"]) for r in rows)
+    r = rows[12]
+    assert r["rcf_shared"] and r["order_probe"] == 2 and len(r["rand_orders"]["test"]) == 2
+    assert r["mse_rand1"] == pytest.approx(np.mean(r["rand_orders"]["test"]))
+    assert r["vs_lr_mult_used"] == pytest.approx(max(1.0, 1.0 / r["budget"])) and r["id_lr_mult"] == "auto"
+    for r in rows[10:12]:
+        for mode, key in (("posterior", "mse_gate"), ("hard", "mse_gate_hard")):
+            g = r["gate"][mode]
+            assert g["q"] in g["val"] and r[key] == g["test"][g["q"]] and g["gated_test"]["1.0"] == 0
+            assert g["test"]["1.0"] == pytest.approx(r.get("mse_orders", r["mse"]), rel=1e-6)
     assert rows[10]["rcf_cycle"] == 24 and rows[11]["rcf_cycle"] == 144 and "cn" not in rows[0]
     assert "mse_unseen" in rows[2] and "mse_seen" in rows[2]
     assert "mse_orders" in rows[3] and rows[0]["mamba_backend"] == "torch"
@@ -306,17 +341,21 @@ def test_end_to_end_cli(tmp_path):
     for skip in (["--skip-existing"], ["--skip-existing", "--seed", "1"]):   # skipped, then run
         subprocess.run(common + ["--model", "smamba", "--identity", "add"] + skip, check=True,
                        cwd=ROOT, capture_output=True)
-    assert len(out.read_text().splitlines()) == 13
+    assert len(out.read_text().splitlines()) == 14
     subprocess.run(common + ["--model", "itransformer", "--identity", "add", "--rcf-cycle", "24",
                              "--vs-dropout", "0.2", "--vs-lr-mult", "10", "--drift-gate",
                              "--skip-existing"], check=True, cwd=ROOT, capture_output=True)
-    assert len(out.read_text().splitlines()) == 14      # differs from row 10 only by --cn
+    assert len(out.read_text().splitlines()) == 15      # differs from row 10 only by --cn
+    subprocess.run(common + ["--model", "smamba", "--identity", "add", "--per-var", "--var-perm", "1",
+                             "--skip-existing"], check=True, cwd=ROOT, capture_output=True)
+    assert len(out.read_text().splitlines()) == 15      # same as row 7, skipped
     summary = subprocess.run([sys.executable, str(ROOT / "tools" / "summarize.py"), str(out)],
                              check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "Weather" in summary and "scan order: shuffle" in summary
     assert "Does the fixed scan order act as an identity?" in summary
     assert "variables in random order 1" in summary and "mse_orders3" in summary
-    assert "add+cn+rcf24+vsdrop0.2+vslr10x+gate" in summary and "mse_gate" in summary
+    assert "add+cn+rcf24+vsdrop0.2+vslr10x+gate" in summary and "mse_gate_hard" in summary
+    assert "none+cn+rcf24sh+vslrauto" in summary and "mse_rand1" in summary
     res = subprocess.run([sys.executable, str(ROOT / "tools" / "per_variable.py"), str(out)],
                          check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "random order 1" in res and "most harmed" in res
