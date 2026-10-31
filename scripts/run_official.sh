@@ -6,20 +6,23 @@
 #   S-Mamba also with a shuffled scan order (none, add), tested over 2 / 4 / 8 orders.
 # The unchanged configurations keep their earlier results (main.jsonl, idlr.jsonl,
 # shuffle_main.jsonl); summarise all files together, the summary pairs only runs with
-# identical training settings.
+# identical training settings. Runs already in $OUT are skipped, so an interrupted run can
+# simply be started again; HORIZONS="192 336" restricts it to some horizons.
 set -euo pipefail
 OUT=${OUT:-results/official.jsonl}
 ROOT=${ROOT:-./data}
 EXTRA=${EXTRA:-"--tf32"}
 SEEDS=${SEEDS:-"0 1 2"}
 DATASETS=${DATASETS:-"ETTh1 ETTh2 ETTm1 ETTm2 Exchange Weather Electricity Traffic"}
+HORIZONS=${HORIZONS:-""}
 for data in $DATASETS; do
   for model in smamba itransformer; do
     for H in $(python -c "from idembed.configs import changed, horizons
 print(*[h for h in horizons('$data') if changed('$model', '$data', h)])"); do
+      if [ -n "$HORIZONS" ] && [[ " $HORIZONS " != *" $H "* ]]; then continue; fi
       lr=$(python -c "from idembed.configs import get_config; print(get_config('$model', '$data', $H)['lr'])")
       for seed in $SEEDS; do
-        common="--model $model --data $data --pred-len $H --seed $seed --root-path $ROOT --out $OUT $EXTRA"
+        common="--model $model --data $data --pred-len $H --seed $seed --root-path $ROOT --out $OUT --skip-existing $EXTRA"
         python run.py $common --identity none
         python run.py $common --identity add
         if python -c "import sys; sys.exit(0 if $lr <= 1e-4 else 1)"; then

@@ -63,6 +63,8 @@ def parse():
     ap.add_argument("--out", default="results/results.jsonl")
     ap.add_argument("--save-ckpt", default=None, help="directory for the best checkpoint")
     ap.add_argument("--tag", default="", help="free-text label stored with the result")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="do nothing if --out already holds a run with exactly this configuration")
     return ap.parse_args()
 
 
@@ -88,6 +90,12 @@ def main():
         if v is not None:
             cfg[k] = v
     print(json.dumps({k: cfg[k] for k in sorted(cfg)}))
+    if a.skip_existing and Path(a.out).exists():
+        with open(a.out) as f:
+            if any(all(r.get(k) == v for k, v in cfg.items())
+                   for r in (json.loads(line) for line in f if line.strip())):
+                print(f"already in {a.out}, skipped")
+                return
     result, model, cols = run(cfg)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     with open(a.out, "a") as f:

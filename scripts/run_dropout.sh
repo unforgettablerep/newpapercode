@@ -20,7 +20,7 @@ for data in $DATASETS; do
   for H in $HORIZONS; do
     for seed in $SEEDS; do
       for model in itransformer smamba; do
-        common="--model $model --data $data --pred-len $H --seed $seed --root-path $ROOT --out $OUT $pv $EXTRA"
+        common="--model $model --data $data --pred-len $H --seed $seed --root-path $ROOT --out $OUT --skip-existing $pv $EXTRA"
         python run.py $common --identity add --id-dropout 0.1
         python run.py $common --identity add --id-dropout 0.3
         if [ "$model" = smamba ]; then

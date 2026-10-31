@@ -241,8 +241,13 @@ def test_end_to_end_cli(tmp_path):
     assert pv["columns"] == ["v0", "v1", "v2", "v3", "v4", "OT"] and len(pv["test_mse"]) == 6
     assert abs(np.mean(pv["test_mse"]) / rows[7]["mse"] - 1) < 1e-4
     assert {"val_mse", "val_mean", "test_mean", "test_std"} <= set(pv) and "per_var" not in rows[6]
-    assert {"mse_orders2", "mse_orders3"} <= set(rows[9])
+    assert {"mse_orders2", "mse_orders3", "val_mse_orders2", "val_mse_orders3"} <= set(rows[9])
     assert rows[9]["mse_orders"] == rows[9]["mse_orders3"]
+    assert rows[9]["val_mse_orders"] == rows[9]["val_mse_orders3"] and "val_mse_orders" in rows[3]
+    for skip in (["--skip-existing"], ["--skip-existing", "--seed", "1"]):   # skipped, then run
+        subprocess.run(common + ["--model", "smamba", "--identity", "add"] + skip, check=True,
+                       cwd=ROOT, capture_output=True)
+    assert len(out.read_text().splitlines()) == 11
     summary = subprocess.run([sys.executable, str(ROOT / "tools" / "summarize.py"), str(out)],
                              check=True, cwd=ROOT, capture_output=True, text=True).stdout
     assert "Weather" in summary and "scan order: shuffle" in summary

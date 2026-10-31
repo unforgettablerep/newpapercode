@@ -28,8 +28,9 @@ h_i = Linear(x_i) + e_i ,   i = 1..N      （e_i 从 0 开始学习）
 | `--id-lr-mult m` | 身份参数的学习率是主学习率的 m 倍。身份参数从 0 开始，Adam 每步大约只移动一个学习率的幅度，而官方学习率很小（Weather 5e-5、ETTh1 7e-5） |
 | `--train-var-ratio ρ` | 未见变量协议：只用随机选出的 ρ 比例的变量训练和验证，测试时预测全部变量，并分别报告已见 / 未见变量的误差；未见变量使用零身份 |
 | `--scan-order shuffle` | （仅 S-Mamba）训练时每一层、每一步都按随机顺序扫描 token，使"在扫描序列中的位置"不再携带变量信息；测试默认按原始顺序 |
-| `--eval-orders K` | 训练好的模型额外在测试时把每层的 Mamba 混合输出在 K 个固定随机顺序上取平均，结果记为 `mse_orders` / `mae_orders`（不需要重新训练）。也可以给逗号分隔的列表（如 `2,4,8`），每个 K 记为 `mse_ordersK` / `mae_ordersK`，`mse_orders` 为最大的 K |
+| `--eval-orders K` | 训练好的模型额外在测试时把每层的 Mamba 混合输出在 K 个固定随机顺序上取平均，结果记为 `mse_orders` / `mae_orders`（不需要重新训练）。也可以给逗号分隔的列表（如 `2,4,8`），每个 K 记为 `mse_ordersK` / `mae_ordersK`，`mse_orders` 为最大的 K。同时记录相同平均方式下的验证 MSE（`val_mse_orders[K]`），用于在验证集上比较随机顺序与固定顺序模型；早停始终按原顺序的单次前向 |
 | `--var-perm s` | 按种子 s 生成的固定随机顺序排列变量（代替文件中的列顺序），用来检验列顺序本身对 S-Mamba 是否有用 |
+| `--skip-existing` | `--out` 中已有完全相同配置的运行时直接跳过，脚本中断后可以原样重新执行 |
 | `--per-var` | 结果中额外记录每个变量（按文件列顺序）的测试 / 验证 MSE，以及验证段、测试段相对训练段的均值与标准差（`result["per_var"]`），供 `tools/per_variable.py` 分析 |
 
 - 身份只加在变量 token 上，日历特征 token 不加。
@@ -88,6 +89,7 @@ python run.py --model smamba --data Electricity --train-var-ratio 0.4 --identity
 | `scripts/run_shuffle_main.sh` | S-Mamba 随机扫描顺序训练 × {无, 有身份} × 全部 8 个数据集 × 全部预测长度，测试时报告原始顺序和 2 / 4 / 8 个顺序平均；固定顺序的对照复用 `run_main.sh` 的结果 | 192 |
 | `scripts/run_official.sh` | 超参数改为官方逐预测长度设置后，重跑设置有变化的 25 个（骨架, 数据集, 预测长度）组合：{无, 有身份, 身份学习率 ×10（学习率不超过 1e-4 时）}，S-Mamba 另加随机扫描顺序 {无, 有身份}；3 个种子 | 336 |
 | `scripts/run_dropout.sh` | Electricity、Traffic × 全部预测长度 × 两种骨架：身份 dropout 0.1 / 0.3；S-Mamba 另加随机扫描顺序 + 身份 dropout 0.1；3 个种子 | 120 |
+| `scripts/run_recipe.sh` | 候选最终方案在其余 6 个数据集（ETT 四个、Exchange、Weather）× 全部预测长度上的运行：iTransformer 身份 + dropout 0.3（身份学习率 ×1 / ×10），S-Mamba 随机扫描顺序 + 身份 + dropout 0.1（K=2/8）；3 个种子 | 216 |
 
 可以用环境变量缩小范围，例如 `DATASETS="Electricity Traffic" SEEDS="0" bash scripts/run_main.sh`。运行时间主要花在 Traffic、Electricity 和 PEMS07 上。
 
@@ -149,6 +151,7 @@ python -m pytest -q tests        # CPU 上约 1 分钟
 - **加入了随机扫描顺序选项**，用来检验"S-Mamba 的提升比 iTransformer 小，是因为固定扫描顺序已经起到了一部分身份作用"这一推测（`scripts/run_order.sh`）。固定顺序时，加入该选项前后的计算逐位相同，所以新实验可以直接和已有的快速实验结果配对比较。
 - **`run_order.sh`、`run_ablation.sh`、`run_main.sh` 已在 4090 上完成**，结果与分析见 newpaper 仓库的 README（实验 2–4）。主要发现：身份嵌入在 Weather、Electricity 的所有预测长度上有效（iTransformer −2.4%～−7.7%，S-Mamba 较小），在 ETT、Exchange 上无作用，在 Traffic 上 MSE 变差 1.5%～6.9%；随机扫描顺序实验证实固定扫描顺序起到了隐式身份的作用；Weather 上身份学习率 ×10 使 S-Mamba 的收益从 −1.8% 增大到 −5.9%。
 - **`run_traffic.sh`、`run_perm.sh`、`run_idlr.sh`、`run_shuffle_main.sh` 已完成**（newpaper README 实验 5–8）。逐项核对官方脚本后发现，legacy 表在 25 个（骨架, 数据集, 预测长度）组合上与官方设置不同（见第 5 节），其中 Traffic 上的 S-Mamba 只训练了 5 轮（官方 10 轮）。超参数表已改为官方设置，`run_official.sh` 重跑这些组合，`run_dropout.sh` 在 Electricity、Traffic 的全部预测长度上测试身份 dropout。默认设置未变的组合，计算与之前逐位相同（主表的 197 次重跑与原结果相差不超过 0.0014%）。
+- **`run_official.sh`（Traffic 上 S-Mamba 的 192/336/720 尚未跑完）和 `run_dropout.sh` 已完成**（newpaper README 实验 9–10）。为下一轮加入了 `--skip-existing`（`run_official.sh`、`run_dropout.sh`、`run_recipe.sh` 默认使用，中断后可原样重跑；`run_official.sh` 还可用 `HORIZONS` 限定预测长度）、随机顺序模型的多顺序验证 MSE，以及 `run_recipe.sh`。
 - **上一轮加入了**：逐变量误差记录（`--per-var`）与分析工具 `tools/per_variable.py`、固定随机变量排列（`--var-perm`）、一次运行测试多个顺序数（`--eval-orders 2,4,8`），以及脚本 `run_traffic.sh`、`run_perm.sh`、`run_idlr.sh`、`run_shuffle_main.sh`。
 
 ## 8. 目录结构
@@ -158,7 +161,7 @@ idembed/          data.py（数据与划分） identity.py（身份嵌入） mam
                   models.py（iTransformer、S-Mamba） engine.py（训练与评估） configs.py（超参数与来源）
 run.py            单次运行的命令行入口
 scripts/          download_data.sh  check_env.py  run_quick.sh  run_main.sh  run_ablation.sh  run_order.sh
-                  run_traffic.sh  run_perm.sh  run_idlr.sh  run_shuffle_main.sh  run_official.sh  run_dropout.sh
+                  run_traffic.sh  run_perm.sh  run_idlr.sh  run_shuffle_main.sh  run_official.sh  run_dropout.sh  run_recipe.sh
 tools/            summarize.py（结果汇总与判定）  analyze_identity.py（身份嵌入的可解释性）
                   per_variable.py（逐变量误差分析）
 tests/            test_core.py

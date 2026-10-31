@@ -9,6 +9,9 @@ Unseen-variable protocol (`train_var_ratio` < 1): a fixed random subset of the v
 used for training and validation; the test set is scored on all variables and separately on
 the seen and the unseen ones. Unseen variables keep the zero identity.
 
+With `eval_orders`, the validation MSE of the same averaging is stored as well
+(`val_mse_orders[K]`; early stopping always uses the single original-order pass).
+
 `per_var`: also store, for every variable (in the file's column order), the test and
 validation MSE and the level / scale of its validation and test splits in units of the
 training statistics, under result["per_var"].
@@ -152,10 +155,13 @@ def run(cfg, log=print):
     for k in ks:                                   # same model, scan-order averaging at test
         model.set_eval_orders(k)
         avg = evaluate(model, test, None, amp_dtype=amp_dtype, groups=groups)
+        avg["val_mse"] = evaluate(model, val, seen, amp_dtype=amp_dtype)["mse"]   # for selection
+        avg = {("val_mse_orders" if name == "val_mse" else f"{name}_orders"): v
+               for name, v in avg.items()}
         if len(ks) > 1:
-            metrics.update({f"{name}_orders{k}": v for name, v in avg.items()})
+            metrics.update({f"{name}{k}": v for name, v in avg.items()})
         if k == ks[-1]:                            # '_orders': the largest number of orders
-            metrics.update({f"{name}_orders": v for name, v in avg.items()})
+            metrics.update(avg)
         model.set_eval_orders(1)
     test_time = time.time() - t1
     if per_var:
