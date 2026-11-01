@@ -17,5 +17,6 @@ newpaper 仓库 README 和 `papers/` 中的数字由这些脚本从结果文件�
 | `tables2.py` | 实验 7–8 的 Markdown 表 | `tables2.py <newpaper> [shuffle\|shuffle_agg\|idlr]` |
 | `off.py` | 实验 9–10：官方设置视图（基线与论文、各变体、方案、验证集选择、综合对比表） | `off.py <newpaper> <newpapercode> [base\|identity\|select\|rules\|final\|final_md\|exp9\|exp10] [out.json]` |
 | `budget.py` | `papers/theory.md` §5：身份参数的学习预算与收益 | `budget.py <newpaper>/results/4090` |
+| `feederbw/` | `papers/application_direction.md` §3：FeederBW 设备台账统计与先导实验 | 见 [`feederbw/README.md`](feederbw/README.md) |
 
 其他工具：`tools/summarize.py`（汇总表）、`tools/per_variable.py`（逐变量分析）、`tools/drift_gate_pilot.py`（漂移路由先导）、`experiments_sim/`（候选方向的沙盒模拟）。
