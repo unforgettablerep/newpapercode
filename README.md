@@ -177,6 +177,8 @@ tools/            summarize.py（结果汇总与判定）  analyze_identity.py�
 tests/            test_core.py
 analysis/         newpaper README 中数字的分析脚本（见 analysis/README.md）
 experiments_sim/  候选方向可行性的沙盒模拟（合成数据，CPU）
+rnk/              可靠性门控的节点知识（newpaper papers/model_direction.md）：模型、台账与投运后验、门控、合成数据、FeederBW；见 rnk/README.md
+run_rnk.py        RNK 单次运行的命令行入口；scripts/run_rnk_sim.sh、scripts/run_rnk_feederbw.sh；tools/summarize_rnk.py
 experiments_cpu/  前期 CPU 探索实验（合成数据 Hub-SSM / 稀疏混合，真实数据上的改进对比），从 paperlib 迁入
 ```
 
